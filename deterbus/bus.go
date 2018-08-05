@@ -2,7 +2,6 @@ package deterbus
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"sync"
 )
@@ -27,28 +26,28 @@ const (
 
 // Bus is a deterministic* event bus.
 type Bus struct {
-	currentNumber   uint64
-	processedNumber uint64
+	publishedNumber uint64
+	consumedNumber  uint64
 	pendingEvents   []argEvent
 	listeners       map[interface{}]([]*eventHandler)
-	eventDone       *sync.Cond
+	consumedCond    *sync.Cond
 	done            chan interface{}
 	draining        bool
-	locker          *sync.Mutex
+	queueLocker     *sync.Mutex
 	heartBeat       chan EventPulse
 }
 
 // New creates a new Bus.
 func New() Bus {
 	eb := Bus{
-		currentNumber:   0,
-		processedNumber: 0,
+		publishedNumber: 0,
+		consumedNumber:  0,
 		pendingEvents:   make([]argEvent, 0),
 		listeners:       make(map[interface{}]([]*eventHandler)),
-		eventDone:       sync.NewCond(&sync.Mutex{}),
+		consumedCond:    sync.NewCond(&sync.Mutex{}),
 		draining:        false,
 		done:            make(chan interface{}),
-		locker:          &sync.Mutex{},
+		queueLocker:     &sync.Mutex{},
 		heartBeat:       make(chan EventPulse, 1),
 	}
 
@@ -83,6 +82,17 @@ func New() Bus {
 	return eb
 }
 
+func (eb *Bus) pop() *argEvent {
+	if len(eb.pendingEvents) == 0 {
+		return nil
+	}
+
+	endEventIndex := len(eb.pendingEvents) - 1
+	ev := eb.pendingEvents[endEventIndex]
+	eb.pendingEvents = eb.pendingEvents[:endEventIndex]
+	return &ev
+}
+
 // EventPulse is an indicator type sent out on the heartbeat channel.
 type EventPulse struct {
 	PublishedEvents uint64
@@ -96,7 +106,7 @@ func (eb *Bus) GetMonitor() <-chan EventPulse {
 }
 func (eb *Bus) pulseMonitor() {
 	select {
-	case eb.heartBeat <- EventPulse{PublishedEvents: eb.currentNumber, ConsumedEvents: eb.processedNumber}:
+	case eb.heartBeat <- EventPulse{PublishedEvents: eb.publishedNumber, ConsumedEvents: eb.consumedNumber}:
 	default:
 	}
 }
@@ -117,10 +127,9 @@ func (eb *Bus) Stop() {
 // Only call this when you are destroying the object,
 // since events will be dropped while draining.
 func (eb *Bus) Drain() <-chan interface{} {
-	eb.locker.Lock()
-	defer eb.locker.Unlock()
-
+	eb.queueLocker.Lock()
 	eb.draining = true
+	eb.queueLocker.Unlock()
 
 	done := make(chan interface{})
 
@@ -131,11 +140,11 @@ func (eb *Bus) Drain() <-chan interface{} {
 	go func() {
 		wg.Done()
 		// Loop until all events are gone.
-		eb.eventDone.L.Lock()
-		for eb.processedNumber != eb.currentNumber {
-			eb.eventDone.Wait()
+		eb.consumedCond.L.Lock()
+		for eb.consumedNumber != eb.publishedNumber {
+			eb.consumedCond.Wait()
 		}
-		eb.eventDone.L.Unlock()
+		eb.consumedCond.L.Unlock()
 
 		close(done)
 	}()
@@ -150,56 +159,57 @@ func (eb *Bus) Drain() <-chan interface{} {
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) <-chan interface{} {
-	eb.locker.Lock()
-	defer eb.locker.Unlock()
-
 	done := make(chan interface{})
 
 	// Quit early if we are draining.
-	if eb.draining {
+	draining := false
+	eb.queueLocker.Lock()
+	draining = eb.draining
+	if draining {
 		close(done)
+		eb.queueLocker.Unlock()
 		return done
 	}
 
 	// Add event to the event queue, and
 	// increment the event number.
-	eb.eventDone.L.Lock()
-	eNum := eb.currentNumber
 
 	// Create the event we need to send.
+	pubNum := eb.publishedNumber + 1
+	eb.publishedNumber = pubNum
+
 	ev := argEvent{
 		topic: topic,
 		ctx: context.WithValue(
-			context.WithValue(ctx, EventTopic, topic), EventNumber, eNum),
+			context.WithValue(ctx, EventTopic, topic), EventNumber, pubNum),
 		args:        args,
-		eventNumber: eNum,
+		eventNumber: pubNum,
 	}
 
 	// Indicate that work is being done.
-	eb.pulseMonitor()
+	//eb.pulseMonitor()
 
 	eb.pendingEvents = append(eb.pendingEvents, ev)
-	eb.currentNumber++
-	eb.eventDone.L.Unlock()
+
+	eb.consumedCond.L.Lock()
+	eb.queueLocker.Unlock()
 
 	// Don't return until the goroutine starts.
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	go func() {
-		wg.Done()
-
+	go func(waitForNum uint64) {
 		// Loop until processedNumber matches the
 		// the number of the event we stuck
 		// into the queue.
-		eb.eventDone.L.Lock()
-		for eb.processedNumber != eNum {
-			eb.eventDone.Wait()
+		wg.Done()
+		for eb.consumedNumber != waitForNum {
+			eb.consumedCond.Wait()
 		}
-		eb.eventDone.L.Unlock()
+		eb.consumedCond.L.Unlock()
 
 		close(done)
-	}()
+	}(pubNum)
 
 	wg.Wait()
 	return done
@@ -211,72 +221,74 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 // Once all listeners finish processing the event, the
 // processedNumber will be increased.
 func consume(eb Bus) {
-	eb.locker.Lock()
+	eb.queueLocker.Lock()
 
-	if len(eb.pendingEvents) == 0 {
-		eb.locker.Unlock()
+	// Pop off the event at the end of the queue
+	ev := eb.pop()
+
+	if ev == nil {
+		eb.queueLocker.Unlock()
 		return
 	}
 
-	// Pop off the event at the end of the queue
-	endEvent := len(eb.pendingEvents) - 1
-	ev := eb.pendingEvents[endEvent]
-	eb.pendingEvents = eb.pendingEvents[:endEvent]
+	// Eventnumbers should always be increasing by 1.
+	//if eb.consumedNumber != ev.eventNumber-1 {
+	//	panic(fmt.Sprintf("events were processed out of order. expected %v, found %v", eb.consumedNumber+1, ev.eventNumber))
+	//}
 
-	eb.locker.Unlock()
-
-	// Increment the event number
-	defer func() {
-		eb.locker.Lock()
-		defer eb.locker.Unlock()
-		eb.eventDone.L.Lock()
-		defer eb.eventDone.L.Unlock()
-		if eb.processedNumber != ev.eventNumber-1 {
-			panic(fmt.Sprintf("events were processed out of order. expected %v, found %v", eb.processedNumber+1, ev.eventNumber))
-		}
-		eb.processedNumber = ev.eventNumber
-
-		// Indicate that work is being done.
-		eb.pulseMonitor()
-
-		// publish completion
-		eb.eventDone.Broadcast()
-
-	}()
+	// Indicate that work is being done.
+	//eb.pulseMonitor()
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
 
 	// no listeners means we are done.
-	if !ok {
-		return
-	}
+	if ok && len(listeners) > 0 {
+		// figure out the params we need to send
+		params := ev.createParams()
 
-	// figure out the params we need to send
-	params := ev.createParams()
+		// call all listeners concurrently and then wait for them to complete.
+		var lwg sync.WaitGroup
+		lwg.Add(len(listeners))
 
-	// call all listeners concurrently and then wait for them to complete.
-	var lwg sync.WaitGroup
-	lwg.Add(len(listeners))
-
-	// need to handle listeners subscribed with Once
-	// before returning, so it's a special case for
-	// unsubscribe.
-	for i := len(listeners) - 1; i >= 0; i-- {
-		listener := listeners[i]
-		// Actually invoke the listener.
-		go func(l *eventHandler) {
-			defer lwg.Done()
-			l.call(params)
-		}(listener)
-		// Remove it from the list if needed.
-		if listener.flagOnce {
-			listeners = append(listeners[:i], listeners[i+1:]...)
+		// need to handle listeners subscribed with Once
+		// before returning, so it's a special case for
+		// unsubscribe.
+		for i := len(listeners) - 1; i >= 0; i-- {
+			listener := listeners[i]
+			// Actually invoke the listener.
+			go func(l *eventHandler) {
+				defer lwg.Done()
+				l.call(params)
+			}(listener)
+			// Remove it from the list if needed.
+			if listener.flagOnce {
+				listeners = append(listeners[:i], listeners[i+1:]...)
+			}
 		}
-	}
 
-	// Wait until all listeners are done.
-	lwg.Wait()
+		// Unlock queue early so publishers can add to it
+		// while we spin on the listeners.
+		eb.queueLocker.Unlock()
+
+		// Wait until all listeners are done.
+		lwg.Wait()
+
+		// Mark that the event is done.
+		eb.consumedCond.L.Lock()
+		eb.consumedNumber = ev.eventNumber
+		eb.consumedCond.L.Unlock()
+		eb.consumedCond.Broadcast()
+
+	} else {
+		eb.queueLocker.Unlock()
+
+		// Mark that the event is done.
+		eb.consumedCond.L.Lock()
+		eb.consumedNumber = ev.eventNumber
+		eb.consumedCond.L.Unlock()
+		eb.consumedCond.Broadcast()
+	}
 }
 
 // Subscribe adds a new handler for the given topic.
@@ -300,8 +312,8 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 }
 
 func subscribe(ctx context.Context, eb Bus, evh eventHandler) {
-	eb.locker.Lock()
-	defer eb.locker.Unlock()
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
 
 	// Add the handler to the topic.
 	_, ok := eb.listeners[evh.topic]
@@ -324,8 +336,8 @@ func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) <-chan interface{}
 }
 
 func unsubscribe(ctx context.Context, eb Bus, topic interface{}, fn interface{}) {
-	eb.locker.Lock()
-	defer eb.locker.Unlock()
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
 
 	v, ok := eb.listeners[topic]
 

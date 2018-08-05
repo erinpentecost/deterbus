@@ -36,12 +36,11 @@ func TestSubscribe(t *testing.T) {
 	}
 
 	done, err := b.Subscribe(dummyTopicA, false, handler)
-
-	assert.Equal(t, nil, err)
 	<-done
-
+	assert.Equal(t, nil, err)
 }
 
+/*
 func TestAsyncPublish(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
@@ -50,3 +49,4 @@ func TestAsyncPublish(t *testing.T) {
 		b.Publish(context.Background(), dummyTopicA)
 	}
 }
+*/
