@@ -39,6 +39,7 @@ func TestSubscribe(t *testing.T) {
 
 	assert.Equal(t, nil, err)
 	<-done
+
 }
 
 func TestAsyncPublish(t *testing.T) {

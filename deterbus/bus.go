@@ -35,6 +35,7 @@ type Bus struct {
 	done            chan interface{}
 	draining        bool
 	locker          *sync.Mutex
+	heartBeat       chan EventPulse
 }
 
 // New creates a new Bus.
@@ -48,6 +49,7 @@ func New() Bus {
 		draining:        false,
 		done:            make(chan interface{}),
 		locker:          &sync.Mutex{},
+		heartBeat:       make(chan EventPulse, 1),
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
@@ -81,12 +83,31 @@ func New() Bus {
 	return eb
 }
 
+// EventPulse is an indicator type sent out on the heartbeat channel.
+type EventPulse struct {
+	PublishedEvents uint64
+	ConsumedEvents  uint64
+}
+
+// GetMonitor returns a heartbeat monitor that can be
+// inspected to identify when events are being processed.
+func (eb *Bus) GetMonitor() <-chan EventPulse {
+	return eb.heartBeat
+}
+func (eb *Bus) pulseMonitor() {
+	select {
+	case eb.heartBeat <- EventPulse{PublishedEvents: eb.currentNumber, ConsumedEvents: eb.processedNumber}:
+	default:
+	}
+}
+
 // Stop shuts down all event processing.
 // You may wish to Drain() first.
 // Only call this when you are destroying the object,
 // since processing can't be restarted.
 func (eb *Bus) Stop() {
 	close(eb.done)
+	close(eb.heartBeat)
 }
 
 // Drain prevents new events from being published,
@@ -134,6 +155,7 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 
 	done := make(chan interface{})
 
+	// Quit early if we are draining.
 	if eb.draining {
 		close(done)
 		return done
@@ -144,14 +166,19 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 	eb.eventDone.L.Lock()
 	eNum := eb.currentNumber
 
-	eb.pendingEvents = append(eb.pendingEvents,
-		argEvent{
-			topic: topic,
-			ctx: context.WithValue(
-				context.WithValue(ctx, EventTopic, topic), EventNumber, eNum),
-			args:        args,
-			eventNumber: eNum,
-		})
+	// Create the event we need to send.
+	ev := argEvent{
+		topic: topic,
+		ctx: context.WithValue(
+			context.WithValue(ctx, EventTopic, topic), EventNumber, eNum),
+		args:        args,
+		eventNumber: eNum,
+	}
+
+	// Indicate that work is being done.
+	eb.pulseMonitor()
+
+	eb.pendingEvents = append(eb.pendingEvents, ev)
 	eb.currentNumber++
 	eb.eventDone.L.Unlock()
 
@@ -161,6 +188,7 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 
 	go func() {
 		wg.Done()
+
 		// Loop until processedNumber matches the
 		// the number of the event we stuck
 		// into the queue.
@@ -207,8 +235,13 @@ func consume(eb Bus) {
 			panic(fmt.Sprintf("events were processed out of order. expected %v, found %v", eb.processedNumber+1, ev.eventNumber))
 		}
 		eb.processedNumber = ev.eventNumber
+
+		// Indicate that work is being done.
+		eb.pulseMonitor()
+
 		// publish completion
 		eb.eventDone.Broadcast()
+
 	}()
 
 	// Find the listeners for it
@@ -229,36 +262,21 @@ func consume(eb Bus) {
 	// need to handle listeners subscribed with Once
 	// before returning, so it's a special case for
 	// unsubscribe.
-	var removeLock sync.Mutex
-	toRemove := make([]int, 0)
-
-	for i, listener := range listeners {
-		go func(i int, l *eventHandler) {
+	for i := len(listeners) - 1; i >= 0; i-- {
+		listener := listeners[i]
+		// Actually invoke the listener.
+		go func(l *eventHandler) {
 			defer lwg.Done()
-			if l.flagOnce {
-				removeLock.Lock()
-				toRemove = append(toRemove, i)
-				removeLock.Unlock()
-			}
 			l.call(params)
-		}(i, listener)
+		}(listener)
+		// Remove it from the list if needed.
+		if listener.flagOnce {
+			listeners = append(listeners[:i], listeners[i+1:]...)
+		}
 	}
 
 	// Wait until all listeners are done.
 	lwg.Wait()
-
-	// Remove listeners that only wanted a single event.
-	if len(toRemove) > 0 {
-		// go through list in reverse so no shifting
-		// is needed when items are removed
-		for i := len(listeners) - 1; i >= 0; i-- {
-			for _, r := range toRemove {
-				if i == r {
-					listeners = append(listeners[:i], listeners[i+1:]...)
-				}
-			}
-		}
-	}
 }
 
 // Subscribe adds a new handler for the given topic.
