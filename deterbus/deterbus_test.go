@@ -13,6 +13,12 @@ func TestConstructor(t *testing.T) {
 	defer b.Stop()
 }
 
+func TestEmptyDrain(t *testing.T) {
+	b := deterbus.New()
+	<-b.Drain()
+	defer b.Stop()
+}
+
 type dummyTopicType int
 
 const (
@@ -35,29 +41,11 @@ func TestSubscribe(t *testing.T) {
 	<-done
 }
 
-/*
-func TestPublish(t *testing.T) {
+func TestAsyncPublish(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	receiveCount := 0
-	publishes := 500
-
-	handler := func(ctx context.Context) {
-		receiveCount++
+	for i := 0; i < 10; i++ {
+		b.Publish(context.Background(), dummyTopicA)
 	}
-
-	done, err := b.Subscribe(dummyTopicA, false, handler)
-
-	assert.Equal(t, nil, err)
-	<-done
-
-	for i := 0; i < publishes; i++ {
-		<-b.Publish(context.Background(), dummyTopicA)
-	}
-
-	b.Drain()
-
-	assert.Equal(t, publishes, receiveCount)
 }
-*/

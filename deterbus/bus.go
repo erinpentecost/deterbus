@@ -184,9 +184,9 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 // processedNumber will be increased.
 func consume(eb Bus) {
 	eb.locker.Lock()
-	defer eb.locker.Unlock()
 
 	if len(eb.pendingEvents) == 0 {
+		eb.locker.Unlock()
 		return
 	}
 
@@ -195,14 +195,20 @@ func consume(eb Bus) {
 	ev := eb.pendingEvents[endEvent]
 	eb.pendingEvents = eb.pendingEvents[:endEvent]
 
+	eb.locker.Unlock()
+
 	// Increment the event number
 	defer func() {
+		eb.locker.Lock()
+		defer eb.locker.Unlock()
 		eb.eventDone.L.Lock()
 		defer eb.eventDone.L.Unlock()
 		if eb.processedNumber != ev.eventNumber-1 {
 			panic(fmt.Sprintf("events were processed out of order. expected %v, found %v", eb.processedNumber+1, ev.eventNumber))
 		}
 		eb.processedNumber = ev.eventNumber
+		// publish completion
+		eb.eventDone.Broadcast()
 	}()
 
 	// Find the listeners for it
@@ -253,9 +259,6 @@ func consume(eb Bus) {
 			}
 		}
 	}
-
-	// publish completion
-	eb.eventDone.Broadcast()
 }
 
 // Subscribe adds a new handler for the given topic.
