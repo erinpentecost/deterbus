@@ -40,10 +40,11 @@ func (evh *eventHandler) call(params []reflect.Value) {
 	evh.callBack.Call(params)
 }
 
+// Store reflected type of context
 var ctxType reflect.Type
 
 func init() {
-	ctxType = reflect.TypeOf(context.TODO())
+	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 }
 
 func newHandler(topic interface{}, once bool, fn interface{}) (*eventHandler, error) {

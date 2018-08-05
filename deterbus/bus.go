@@ -3,6 +3,7 @@ package deterbus
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 )
 
@@ -46,6 +47,7 @@ func New() Bus {
 		eventDone:       sync.NewCond(&sync.Mutex{}),
 		draining:        false,
 		done:            make(chan interface{}),
+		locker:          &sync.Mutex{},
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
@@ -67,7 +69,11 @@ func New() Bus {
 			case <-eb.done:
 				return
 			default:
+				// TODO: This is just a busy spinwait loop.
+				// Refactor so consume() is not being invoked
+				// all the time.
 				consume(eb)
+				runtime.Gosched()
 			}
 		}
 	}()
@@ -179,6 +185,10 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 func consume(eb Bus) {
 	eb.locker.Lock()
 	defer eb.locker.Unlock()
+
+	if len(eb.pendingEvents) == 0 {
+		return
+	}
 
 	// Pop off the event at the end of the queue
 	endEvent := len(eb.pendingEvents) - 1
