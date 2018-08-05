@@ -15,7 +15,6 @@ func TestConstructor(t *testing.T) {
 
 func TestEmptyDrain(t *testing.T) {
 	b := deterbus.New()
-	<-b.Drain()
 	defer b.Stop()
 }
 

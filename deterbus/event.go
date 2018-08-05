@@ -21,6 +21,7 @@ type argEvent struct {
 	ctx         context.Context
 	args        []interface{}
 	eventNumber uint64
+	finished    chan interface{}
 }
 
 func (ev *argEvent) createParams() []reflect.Value {

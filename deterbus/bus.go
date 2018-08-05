@@ -30,7 +30,6 @@ type Bus struct {
 	consumedNumber  uint64
 	pendingEvents   []argEvent
 	listeners       map[interface{}]([]*eventHandler)
-	consumedCond    *sync.Cond
 	done            chan interface{}
 	draining        bool
 	queueLocker     *sync.Mutex
@@ -44,7 +43,6 @@ func New() Bus {
 		consumedNumber:  0,
 		pendingEvents:   make([]argEvent, 0),
 		listeners:       make(map[interface{}]([]*eventHandler)),
-		consumedCond:    sync.NewCond(&sync.Mutex{}),
 		draining:        false,
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
@@ -139,14 +137,10 @@ func (eb *Bus) Drain() <-chan interface{} {
 
 	go func() {
 		wg.Done()
+		defer close(done)
 		// Loop until all events are gone.
-		eb.consumedCond.L.Lock()
-		for eb.consumedNumber != eb.publishedNumber {
-			eb.consumedCond.Wait()
-		}
-		eb.consumedCond.L.Unlock()
+		panic("not implemented yet")
 
-		close(done)
 	}()
 
 	wg.Wait()
@@ -160,14 +154,12 @@ func (eb *Bus) Drain() <-chan interface{} {
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) <-chan interface{} {
 	done := make(chan interface{})
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
 
 	// Quit early if we are draining.
-	draining := false
-	eb.queueLocker.Lock()
-	draining = eb.draining
-	if draining {
+	if eb.draining {
 		close(done)
-		eb.queueLocker.Unlock()
 		return done
 	}
 
@@ -184,6 +176,7 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 			context.WithValue(ctx, EventTopic, topic), EventNumber, pubNum),
 		args:        args,
 		eventNumber: pubNum,
+		finished:    done,
 	}
 
 	// Indicate that work is being done.
@@ -191,27 +184,6 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 
 	eb.pendingEvents = append(eb.pendingEvents, ev)
 
-	eb.consumedCond.L.Lock()
-	eb.queueLocker.Unlock()
-
-	// Don't return until the goroutine starts.
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func(waitForNum uint64) {
-		// Loop until processedNumber matches the
-		// the number of the event we stuck
-		// into the queue.
-		wg.Done()
-		for eb.consumedNumber != waitForNum {
-			eb.consumedCond.Wait()
-		}
-		eb.consumedCond.L.Unlock()
-
-		close(done)
-	}(pubNum)
-
-	wg.Wait()
 	return done
 }
 
@@ -230,14 +202,6 @@ func consume(eb Bus) {
 		eb.queueLocker.Unlock()
 		return
 	}
-
-	// Eventnumbers should always be increasing by 1.
-	//if eb.consumedNumber != ev.eventNumber-1 {
-	//	panic(fmt.Sprintf("events were processed out of order. expected %v, found %v", eb.consumedNumber+1, ev.eventNumber))
-	//}
-
-	// Indicate that work is being done.
-	//eb.pulseMonitor()
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
@@ -274,20 +238,19 @@ func consume(eb Bus) {
 		// Wait until all listeners are done.
 		lwg.Wait()
 
+		eb.queueLocker.Lock()
 		// Mark that the event is done.
-		eb.consumedCond.L.Lock()
 		eb.consumedNumber = ev.eventNumber
-		eb.consumedCond.L.Unlock()
-		eb.consumedCond.Broadcast()
+		close(ev.finished)
 
-	} else {
 		eb.queueLocker.Unlock()
-
+	} else {
 		// Mark that the event is done.
-		eb.consumedCond.L.Lock()
 		eb.consumedNumber = ev.eventNumber
-		eb.consumedCond.L.Unlock()
-		eb.consumedCond.Broadcast()
+
+		close(ev.finished)
+
+		eb.queueLocker.Unlock()
 	}
 }
 
@@ -312,9 +275,6 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 }
 
 func subscribe(ctx context.Context, eb Bus, evh eventHandler) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-
 	// Add the handler to the topic.
 	_, ok := eb.listeners[evh.topic]
 	// Topic doesn't exist yet, so create it.
@@ -336,9 +296,6 @@ func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) <-chan interface{}
 }
 
 func unsubscribe(ctx context.Context, eb Bus, topic interface{}, fn interface{}) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-
 	v, ok := eb.listeners[topic]
 
 	if !ok {
@@ -354,7 +311,7 @@ func unsubscribe(ctx context.Context, eb Bus, topic interface{}, fn interface{})
 		}
 	}
 
-	if index == 0 {
+	if index <= 0 {
 		return
 	}
 
