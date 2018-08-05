@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@bazel_gazelle//:def.bzl", "gazelle")
+
+# A Gazelle executable for auto-generating Go BUILD definitions
+gazelle(
+    name = "gazelle",
+    prefix = "github.com/erinpentecost/deterbus",
+)
+
+# Import project dependencies.
+# This is done automatically by gazelle.
