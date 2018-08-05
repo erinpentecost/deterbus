@@ -56,9 +56,11 @@ func newHandler(topic interface{}, once bool, fn interface{}) (*eventHandler, er
 	if reflect.Type.NumIn(reflect.TypeOf(fn)) == 0 {
 		return nil, errors.New("function must have at least one parameter")
 	}
-	if reflect.Type.In(reflect.TypeOf(fn), 0).Implements(ctxType) {
-		return nil, fmt.Errorf("function's first parameter must implement context.Context, not %s",
-			reflect.Type.In(reflect.TypeOf(fn), 0).Kind())
+	firstParam := reflect.Type.In(reflect.TypeOf(fn), 0)
+	if !firstParam.Implements(ctxType) {
+		return nil, fmt.Errorf("function's first parameter must implement %s, not %s",
+			ctxType.Name(),
+			firstParam.Name())
 	}
 
 	// Wrap it up.
