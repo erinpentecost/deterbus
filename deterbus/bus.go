@@ -36,7 +36,7 @@ type Bus struct {
 }
 
 // New creates a new Bus.
-func New() Bus {
+func New() (*Bus, error) {
 	eb := Bus{
 		publishedNumber: 0,
 		consumedNumber:  0,
@@ -51,8 +51,15 @@ func New() Bus {
 	// Subscribe and Unsubscribe are treated as events.
 	// This helps make the whole thing more deterministic.
 	// But to get this to work, we need to bootstrap them in.
-	subHandler, _ := newHandler(subscribeEvent, false, subscribe)
-	unsubHandler, _ := newHandler(unsubscribeEvent, false, unsubscribe)
+	subHandler, subErr := newHandler(subscribeEvent, false, subscribe)
+	unsubHandler, unsubErr := newHandler(unsubscribeEvent, false, unsubscribe)
+
+	if subErr != nil {
+		return nil, subErr
+	}
+	if unsubErr != nil {
+		return nil, unsubErr
+	}
 
 	eb.listeners[subscribeEvent] = []*eventHandler{subHandler}
 	eb.listeners[unsubscribeEvent] = []*eventHandler{unsubHandler}
@@ -65,17 +72,21 @@ func New() Bus {
 				return
 			default:
 				// TODO: This is just a busy spinwait loop.
-				// Refactor so consume() is not being invoked
-				// all the time.
-				consume(eb)
+				// Pop off the event at the end of the queue
+				ev := eb.pop()
+				<-processEvent(&eb, ev)
 			}
 		}
 	}()
 
-	return eb
+	return &eb, nil
 }
 
+// pop obtains a lock
 func (eb *Bus) pop() *argEvent {
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
+
 	if len(eb.pendingEvents) == 0 {
 		return nil
 	}
@@ -176,71 +187,63 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 	return done
 }
 
-// consume runs in a go routine and pops off the oldest event
-// in the queue and sends it to all listeners.
-// This call blocks until all listeners are done.
-// Once all listeners finish processing the event, the
-// processedNumber will be increased.
-func consume(eb Bus) {
-	eb.queueLocker.Lock()
-
-	// Pop off the event at the end of the queue
-	ev := eb.pop()
+// processEvent obtains a lock.
+func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
+	done := make(chan interface{})
+	defer close(done)
 
 	if ev == nil {
-		eb.queueLocker.Unlock()
-		return
+		return done
 	}
+
+	eb.queueLocker.Lock()
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
 
-	// no listeners means we are done.
-	if ok && len(listeners) > 0 {
-		// figure out the params we need to send
-		params := ev.createParams()
-
-		// call all listeners concurrently and then wait for them to complete.
-		var lwg sync.WaitGroup
-		lwg.Add(len(listeners))
-
-		// need to handle listeners subscribed with Once
-		// before returning, so it's a special case for
-		// unsubscribe.
-		for i := len(listeners) - 1; i >= 0; i-- {
-			listener := listeners[i]
-			// Actually invoke the listener.
-			go func(l *eventHandler) {
-				defer lwg.Done()
-				l.call(params)
-			}(listener)
-			// Remove it from the list if needed.
-			if listener.flagOnce {
-				listeners = append(listeners[:i], listeners[i+1:]...)
-			}
-		}
-
-		// Unlock queue early so publishers can add to it
-		// while we spin on the listeners.
+	// If there are no listeners, just quit.
+	if !ok || len(listeners) == 0 {
 		eb.queueLocker.Unlock()
-
-		// Wait until all listeners are done.
-		lwg.Wait()
-
-		eb.queueLocker.Lock()
-		// Mark that the event is done.
-		eb.consumedNumber = ev.eventNumber
-		close(ev.finished)
-
-		eb.queueLocker.Unlock()
-	} else {
-		// Mark that the event is done.
-		eb.consumedNumber = ev.eventNumber
-
-		close(ev.finished)
-
-		eb.queueLocker.Unlock()
+		return done
 	}
+
+	// call all listeners concurrently and then wait for them to complete.
+	var lwg sync.WaitGroup
+	lwg.Add(len(listeners))
+
+	params := ev.createParams()
+
+	// need to handle listeners subscribed with Once
+	// before returning, so it's a special case for
+	// unsubscribe.
+	for i := len(listeners) - 1; i >= 0; i-- {
+		listener := listeners[i]
+		// Actually invoke the listener.
+		go func(l *eventHandler) {
+			defer lwg.Done()
+			l.call(params)
+		}(listener)
+		// Remove it from the list if needed.
+		if listener.flagOnce {
+			listeners = append(listeners[:i], listeners[i+1:]...)
+		}
+	}
+
+	// Unlock queue early so publishers can add to it
+	// while we spin on the listeners.
+	eb.queueLocker.Unlock()
+
+	// Wait until all listeners are done.
+	lwg.Wait()
+
+	// Mark that the event is done.
+	eb.queueLocker.Lock()
+	// todo assert eventnumber is 1 higher than consumed number
+	eb.consumedNumber = ev.eventNumber
+	eb.queueLocker.Unlock()
+	close(ev.finished)
+
+	return done
 }
 
 // Subscribe adds a new handler for the given topic.

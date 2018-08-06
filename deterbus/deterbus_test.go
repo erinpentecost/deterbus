@@ -9,12 +9,14 @@ import (
 )
 
 func TestConstructor(t *testing.T) {
-	b := deterbus.New()
+	b, er := deterbus.New()
+	assert.Equal(t, nil, er)
 	defer b.Stop()
 }
 
 func TestEmptyDrain(t *testing.T) {
-	b := deterbus.New()
+	b, er := deterbus.New()
+	assert.Equal(t, nil, er)
 	defer b.Stop()
 }
 
@@ -25,7 +27,8 @@ const (
 )
 
 func TestSubscribe(t *testing.T) {
-	b := deterbus.New()
+	b, er := deterbus.New()
+	assert.Equal(t, nil, er)
 	defer b.Stop()
 
 	receiveCount := 0
