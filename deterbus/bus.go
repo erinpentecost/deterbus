@@ -2,7 +2,6 @@ package deterbus
 
 import (
 	"context"
-	"runtime"
 	"sync"
 )
 
@@ -59,10 +58,7 @@ func New() Bus {
 	eb.listeners[unsubscribeEvent] = []*eventHandler{unsubHandler}
 
 	// Start consumer.
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		wg.Done()
 		for {
 			select {
 			case <-eb.done:
@@ -72,11 +68,10 @@ func New() Bus {
 				// Refactor so consume() is not being invoked
 				// all the time.
 				consume(eb)
-				runtime.Gosched()
 			}
 		}
 	}()
-	wg.Wait()
+
 	return eb
 }
 
@@ -131,19 +126,13 @@ func (eb *Bus) Drain() <-chan interface{} {
 
 	done := make(chan interface{})
 
-	// Don't return until the goroutine starts.
-	var wg sync.WaitGroup
-	wg.Add(1)
-
 	go func() {
-		wg.Done()
 		defer close(done)
 		// Loop until all events are gone.
 		panic("not implemented yet")
 
 	}()
 
-	wg.Wait()
 	return done
 }
 
@@ -275,6 +264,9 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 }
 
 func subscribe(ctx context.Context, eb Bus, evh eventHandler) {
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
+
 	// Add the handler to the topic.
 	_, ok := eb.listeners[evh.topic]
 	// Topic doesn't exist yet, so create it.
@@ -296,6 +288,9 @@ func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) <-chan interface{}
 }
 
 func unsubscribe(ctx context.Context, eb Bus, topic interface{}, fn interface{}) {
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
+
 	v, ok := eb.listeners[topic]
 
 	if !ok {
