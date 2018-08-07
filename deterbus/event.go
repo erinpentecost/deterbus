@@ -2,7 +2,6 @@ package deterbus
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 )
@@ -52,14 +51,15 @@ func newHandler(topic interface{}, once bool, fn interface{}) (*eventHandler, er
 
 	// Verify input.
 	if reflect.TypeOf(fn).Kind() != reflect.Func {
-		return nil, fmt.Errorf("%s is not of type reflect.Func", reflect.TypeOf(fn).Kind())
+		return nil, fmt.Errorf("topic %s: %s is not of type reflect.Func", topic, reflect.TypeOf(fn).Kind())
 	}
 	if reflect.Type.NumIn(reflect.TypeOf(fn)) == 0 {
-		return nil, errors.New("function must have at least one parameter")
+		return nil, fmt.Errorf("topic %s: function must have at least one parameter", topic)
 	}
 	firstParam := reflect.Type.In(reflect.TypeOf(fn), 0)
 	if !firstParam.Implements(ctxType) {
-		return nil, fmt.Errorf("function's first parameter must implement %s, not %s",
+		return nil, fmt.Errorf("topic %s: function's first parameter must implement %s, not %s",
+			topic,
 			ctxType.Name(),
 			firstParam.Name())
 	}
