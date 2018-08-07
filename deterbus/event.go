@@ -29,7 +29,7 @@ func (ev *argEvent) createParams() []reflect.Value {
 	// Create arguments to pass in via reflection.
 	// Context needs to be prepended.
 	params := []reflect.Value{reflect.ValueOf(ev.ctx)}
-	for _, arg := range params {
+	for _, arg := range ev.args {
 		params = append(params, reflect.ValueOf(arg))
 	}
 

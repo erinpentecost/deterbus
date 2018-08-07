@@ -32,7 +32,7 @@ type Bus struct {
 	done            chan interface{}
 	draining        bool
 	queueLocker     *sync.Mutex
-	heartBeat       chan EventPulse
+	eventWatcher    *sync.Cond
 }
 
 // New creates a new Bus.
@@ -45,7 +45,7 @@ func New() (*Bus, error) {
 		draining:        false,
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
-		heartBeat:       make(chan EventPulse, 1),
+		eventWatcher:    sync.NewCond(&sync.Mutex{}),
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
@@ -71,8 +71,15 @@ func New() (*Bus, error) {
 			case <-eb.done:
 				return
 			default:
-				// TODO: This is just a busy spinwait loop.
-				// Pop off the event at the end of the queue
+				// TODO: Suspend the go routine instead of
+				// spinwaiting.
+				// Loop while events are available.
+				//eb.eventWatcher.L.Lock()
+				//for eb.consumedNumber > eb.publishedNumber {
+				//	eb.eventWatcher.Wait()
+				//}
+				//eb.eventWatcher.L.Unlock()
+
 				ev := eb.pop()
 				<-processEvent(&eb, ev)
 			}
@@ -97,40 +104,22 @@ func (eb *Bus) pop() *argEvent {
 	return &ev
 }
 
-// EventPulse is an indicator type sent out on the heartbeat channel.
-type EventPulse struct {
-	PublishedEvents uint64
-	ConsumedEvents  uint64
-}
-
-// GetMonitor returns a heartbeat monitor that can be
-// inspected to identify when events are being processed.
-func (eb *Bus) GetMonitor() <-chan EventPulse {
-	return eb.heartBeat
-}
-func (eb *Bus) pulseMonitor() {
-	select {
-	case eb.heartBeat <- EventPulse{PublishedEvents: eb.publishedNumber, ConsumedEvents: eb.consumedNumber}:
-	default:
-	}
-}
-
-// Stop shuts down all event processing.
-// You may wish to Drain() first.
+// Stop shuts down all event processing,
+// throwing away queued events.
 // Only call this when you are destroying the object,
 // since processing can't be restarted.
 func (eb *Bus) Stop() {
 	close(eb.done)
-	close(eb.heartBeat)
 }
 
-// Drain prevents new events from being published,
+// DrainStop prevents new events from being published,
 // but will wait for already-queued events to finish
 // being consumed. The channel returned indicates
 // when draining is complete.
+// Once complete, the Bus will be closed down.
 // Only call this when you are destroying the object,
 // since events will be dropped while draining.
-func (eb *Bus) Drain() <-chan interface{} {
+func (eb *Bus) DrainStop() <-chan interface{} {
 	eb.queueLocker.Lock()
 	eb.draining = true
 	eb.queueLocker.Unlock()
@@ -140,8 +129,12 @@ func (eb *Bus) Drain() <-chan interface{} {
 	go func() {
 		defer close(done)
 		// Loop until all events are gone.
-		panic("not implemented yet")
-
+		eb.eventWatcher.L.Lock()
+		for eb.consumedNumber < eb.publishedNumber {
+			eb.eventWatcher.Wait()
+		}
+		eb.eventWatcher.L.Unlock()
+		close(eb.done)
 	}()
 
 	return done
@@ -167,8 +160,11 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 	// increment the event number.
 
 	// Create the event we need to send.
+	eb.eventWatcher.L.Lock()
 	pubNum := eb.publishedNumber + 1
 	eb.publishedNumber = pubNum
+	eb.eventWatcher.Broadcast()
+	eb.eventWatcher.L.Unlock()
 
 	ev := argEvent{
 		topic: topic,
@@ -239,7 +235,10 @@ func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
 	// Mark that the event is done.
 	eb.queueLocker.Lock()
 	// todo assert eventnumber is 1 higher than consumed number
+	eb.eventWatcher.L.Lock()
 	eb.consumedNumber = ev.eventNumber
+	eb.eventWatcher.Broadcast()
+	eb.eventWatcher.L.Unlock()
 	eb.queueLocker.Unlock()
 	close(ev.finished)
 
@@ -266,7 +265,7 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 	return eb.Publish(context.Background(), subscribeEvent, eb, evh), err
 }
 
-func subscribe(ctx context.Context, eb Bus, evh eventHandler) {
+func subscribe(ctx context.Context, eb *Bus, evh *eventHandler) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
@@ -277,7 +276,7 @@ func subscribe(ctx context.Context, eb Bus, evh eventHandler) {
 		eb.listeners[evh.topic] = make([]*eventHandler, 1)
 	}
 	// Add it to the list.
-	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], &evh)
+	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], evh)
 }
 
 // Unsubscribe removes a handler from the given topic.
@@ -290,7 +289,7 @@ func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) <-chan interface{}
 	return eb.Publish(context.Background(), unsubscribeEvent, eb, topic, fn)
 }
 
-func unsubscribe(ctx context.Context, eb Bus, topic interface{}, fn interface{}) {
+func unsubscribe(ctx context.Context, eb *Bus, topic interface{}, fn interface{}) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
