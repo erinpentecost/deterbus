@@ -2,6 +2,8 @@ package deterbus
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -145,7 +147,7 @@ func (eb *Bus) DrainStop() <-chan interface{} {
 // followed by args.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) <-chan interface{} {
+func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
@@ -153,11 +155,23 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 	// Quit early if we are draining.
 	if eb.draining {
 		close(done)
-		return done
+		return done, errors.New("bus is draining")
 	}
 
-	// Add event to the event queue, and
-	// increment the event number.
+	// Check that the arg count is correct
+	currentListeners, ok := eb.listeners[topic]
+	if ok && len(currentListeners) > 0 {
+		listenerInput, err := getInputTypes(currentListeners[0].shape)
+		if err != nil {
+			close(done)
+			return done, err
+		}
+		ok, err := typesMatch(getTypes(args), listenerInput)
+		if !ok {
+			close(done)
+			return done, err
+		}
+	}
 
 	// Create the event we need to send.
 	eb.eventWatcher.L.Lock()
@@ -175,12 +189,9 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 		finished:    done,
 	}
 
-	// Indicate that work is being done.
-	//eb.pulseMonitor()
-
 	eb.pendingEvents = append(eb.pendingEvents, ev)
 
-	return done
+	return done, nil
 }
 
 // processEvent obtains a lock.
@@ -234,7 +245,6 @@ func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
 
 	// Mark that the event is done.
 	eb.queueLocker.Lock()
-	// todo assert eventnumber is 1 higher than consumed number
 	eb.eventWatcher.L.Lock()
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
@@ -262,19 +272,31 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 		return done, err
 	}
 
-	return eb.Publish(context.Background(), subscribeEvent, eb, evh), err
+	// Create the listener collection
+	eb.queueLocker.Lock()
+	currentListeners, ok := eb.listeners[evh.topic]
+	// Topic doesn't exist yet, so create it.
+	if !ok {
+		eb.listeners[evh.topic] = make([]*eventHandler, 1)
+	} else if len(currentListeners) > 0 {
+		// make sure the function type is the same as other listeners
+		if currentListeners[0].shape != evh.shape {
+			done := make(chan interface{})
+			defer close(done)
+			eb.queueLocker.Unlock()
+			return done, fmt.Errorf("new subscriber for %s has a different function definition", evh.topic)
+		}
+
+	}
+	eb.queueLocker.Unlock()
+
+	return eb.Publish(context.Background(), subscribeEvent, eb, evh)
 }
 
 func subscribe(ctx context.Context, eb *Bus, evh *eventHandler) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
-	// Add the handler to the topic.
-	_, ok := eb.listeners[evh.topic]
-	// Topic doesn't exist yet, so create it.
-	if !ok {
-		eb.listeners[evh.topic] = make([]*eventHandler, 1)
-	}
 	// Add it to the list.
 	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], evh)
 }
@@ -285,7 +307,7 @@ func subscribe(ctx context.Context, eb *Bus, evh *eventHandler) {
 // yet.
 // This function returns a channel indicating when the unsubscribe
 // has taken effect.
-func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) <-chan interface{} {
+func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
 	return eb.Publish(context.Background(), unsubscribeEvent, eb, topic, fn)
 }
 

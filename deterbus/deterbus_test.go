@@ -2,6 +2,7 @@ package deterbus_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/erinpentecost/deterbus/deterbus"
@@ -25,6 +26,15 @@ type dummyTopicType int
 const (
 	dummyTopicA dummyTopicType = iota
 )
+
+func TestFnType(t *testing.T) {
+	sampleFn := func() bool {
+		return true
+	}
+
+	assert.Equal(t, reflect.Func, reflect.TypeOf(sampleFn).Kind())
+	assert.Equal(t, reflect.Func, reflect.TypeOf(TestFnType).Kind())
+}
 
 func TestSubscribe(t *testing.T) {
 	b, er := deterbus.New()

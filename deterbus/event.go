@@ -37,11 +37,6 @@ func (ev *argEvent) createParams() []reflect.Value {
 }
 
 func (evh *eventHandler) call(params []reflect.Value) {
-	hParamCount := evh.shape.NumIn()
-	if hParamCount != len(params) {
-		panic(fmt.Sprintf("expected %v params, not %v", hParamCount, len(params)))
-	}
-
 	// Actually call the function.
 	evh.callBack.Call(params)
 }
