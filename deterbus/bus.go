@@ -166,7 +166,10 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 			close(done)
 			return done, err
 		}
-		ok, err := typesMatch(getTypes(args), listenerInput)
+		argSlice := make([]interface{}, len(args)+1)
+		argSlice = append(argSlice, ctx)
+		argSlice = append(argSlice, args...)
+		ok, err := typesMatch(getTypes(argSlice), listenerInput)
 		if !ok {
 			close(done)
 			return done, err

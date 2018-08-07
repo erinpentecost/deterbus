@@ -5,9 +5,7 @@ import (
 	"reflect"
 )
 
-func getInputTypes(fn interface{}) ([]reflect.Type, error) {
-	fnType := reflect.TypeOf(fn)
-
+func getInputTypes(fnType reflect.Type) ([]reflect.Type, error) {
 	if fnType.Kind() != reflect.Func {
 		return nil, fmt.Errorf("%s is not of type reflect.Func", fnType.Kind())
 	}
