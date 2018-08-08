@@ -36,10 +36,10 @@ func typesMatch(a []reflect.Type, b []reflect.Type) (bool, error) {
 	}
 
 	//todo: fix
-	//for i := 0; i < len(a); i++ {
-	//	if a[i].Kind() != b[i].Kind() {
-	//		return false, fmt.Errorf("a[%v] != b[%v], %s != %s", i, i, a[i].Kind(), b[i].Kind())
-	//	}
-	//}
+	for i := 0; i < len(a); i++ {
+		if a[i].Kind() != b[i].Kind() {
+			return false, fmt.Errorf("a[%v] != b[%v], %s != %s", i, i, a[i].Kind(), b[i].Kind())
+		}
+	}
 	return true, nil
 }

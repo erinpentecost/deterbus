@@ -3,6 +3,8 @@ package deterbus_test
 import (
 	"context"
 	"reflect"
+	"sort"
+	"sync"
 	"testing"
 
 	"github.com/erinpentecost/deterbus/deterbus"
@@ -10,21 +12,20 @@ import (
 )
 
 func TestConstructor(t *testing.T) {
-	b, er := deterbus.New()
-	assert.Equal(t, nil, er)
-	defer b.Stop()
+	b := deterbus.New()
+	b.Stop()
 }
 
 func TestEmptyDrain(t *testing.T) {
-	b, er := deterbus.New()
-	assert.Equal(t, nil, er)
-	defer b.Stop()
+	b := deterbus.New()
+	<-b.DrainStop()
 }
 
 type dummyTopicType int
 
 const (
 	dummyTopicA dummyTopicType = iota
+	dummyTopicB
 )
 
 func TestFnType(t *testing.T) {
@@ -37,8 +38,7 @@ func TestFnType(t *testing.T) {
 }
 
 func TestSubscribe(t *testing.T) {
-	b, er := deterbus.New()
-	assert.Equal(t, nil, er)
+	b := deterbus.New()
 	defer b.Stop()
 
 	receiveCount := 0
@@ -52,13 +52,42 @@ func TestSubscribe(t *testing.T) {
 	assert.Equal(t, nil, err)
 }
 
-/*
 func TestAsyncPublish(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	for i := 0; i < 10; i++ {
-		b.Publish(context.Background(), dummyTopicA)
+	count := 1000
+
+	pubsSeen := make([]int, 0)
+
+	handler := func(ctx context.Context, id int) {
+		pubsSeen = append(pubsSeen, id)
+	}
+
+	s, er := b.Subscribe(dummyTopicA, false, handler)
+
+	assert.Equal(t, nil, er)
+
+	<-s
+
+	var wg sync.WaitGroup
+	wg.Add(count)
+	for i := 0; i < count; i++ {
+		go func() {
+			defer wg.Done()
+			p, er := b.Publish(context.Background(), dummyTopicA, i)
+			assert.Equal(t, nil, er)
+			<-p
+		}()
+	}
+
+	wg.Wait()
+
+	assert.Equal(t, len(pubsSeen), count, "publishes missing")
+
+	sort.Ints(pubsSeen)
+
+	for i := 0; i < count; i++ {
+		assert.Equal(t, i, pubsSeen[i])
 	}
 }
-*/

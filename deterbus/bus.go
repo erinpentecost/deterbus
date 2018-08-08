@@ -38,7 +38,7 @@ type Bus struct {
 }
 
 // New creates a new Bus.
-func New() (*Bus, error) {
+func New() *Bus {
 	eb := Bus{
 		publishedNumber: 0,
 		consumedNumber:  0,
@@ -57,14 +57,14 @@ func New() (*Bus, error) {
 	unsubHandler, unsubErr := newHandler(unsubscribeEvent, false, unsubscribe)
 
 	if subErr != nil {
-		return nil, subErr
+		panic(subErr)
 	}
 	if unsubErr != nil {
-		return nil, unsubErr
+		panic(unsubErr)
 	}
 
-	eb.listeners[subscribeEvent] = []*eventHandler{subHandler}
-	eb.listeners[unsubscribeEvent] = []*eventHandler{unsubHandler}
+	eb.listeners[subscribeEvent] = []*eventHandler{&subHandler}
+	eb.listeners[unsubscribeEvent] = []*eventHandler{&unsubHandler}
 
 	// Start consumer.
 	go func() {
@@ -88,7 +88,7 @@ func New() (*Bus, error) {
 		}
 	}()
 
-	return &eb, nil
+	return &eb
 }
 
 // pop obtains a lock
@@ -158,24 +158,6 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 		return done, errors.New("bus is draining")
 	}
 
-	// Check that the arg count is correct
-	currentListeners, ok := eb.listeners[topic]
-	if ok && len(currentListeners) > 0 {
-		listenerInput, err := getInputTypes(currentListeners[0].shape)
-		if err != nil {
-			close(done)
-			return done, err
-		}
-		argSlice := make([]interface{}, 1, 1)
-		argSlice[0] = ctx
-		argSlice = append(argSlice, args...)
-		ok, err := typesMatch(getTypes(argSlice...), listenerInput)
-		if !ok {
-			close(done)
-			return done, err
-		}
-	}
-
 	// Create the event we need to send.
 	eb.eventWatcher.L.Lock()
 	pubNum := eb.publishedNumber + 1
@@ -228,6 +210,9 @@ func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
 	// unsubscribe.
 	for i := len(listeners) - 1; i >= 0; i-- {
 		listener := listeners[i]
+		if listener == nil {
+			panic(fmt.Sprintf("%vth listener for %s is nil", i, ev.topic))
+		}
 		// Actually invoke the listener.
 		go func(l *eventHandler) {
 			defer lwg.Done()
@@ -252,9 +237,8 @@ func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
 	eb.eventWatcher.L.Unlock()
-	eb.queueLocker.Unlock()
 	close(ev.finished)
-
+	eb.queueLocker.Unlock()
 	return done
 }
 
@@ -279,8 +263,8 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 	eb.queueLocker.Lock()
 	currentListeners, ok := eb.listeners[evh.topic]
 	// Topic doesn't exist yet, so create it.
-	if !ok {
-		eb.listeners[evh.topic] = make([]*eventHandler, 1)
+	if (!ok) || currentListeners == nil {
+		eb.listeners[evh.topic] = make([]*eventHandler, 0)
 	} else if len(currentListeners) > 0 {
 		// make sure the function type is the same as other listeners
 		if currentListeners[0].shape != evh.shape {
@@ -296,12 +280,12 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 	return eb.Publish(context.Background(), subscribeEvent, eb, evh)
 }
 
-func subscribe(ctx context.Context, eb *Bus, evh *eventHandler) {
+func subscribe(ctx context.Context, eb *Bus, evh eventHandler) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
 	// Add it to the list.
-	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], evh)
+	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], &evh)
 }
 
 // Unsubscribe removes a handler from the given topic.

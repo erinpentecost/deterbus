@@ -47,25 +47,25 @@ func init() {
 	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 }
 
-func newHandler(topic interface{}, once bool, fn interface{}) (*eventHandler, error) {
+func newHandler(topic interface{}, once bool, fn interface{}) (eventHandler, error) {
 
 	// Verify input.
 	if reflect.TypeOf(fn).Kind() != reflect.Func {
-		return nil, fmt.Errorf("topic %s: %s is not of type reflect.Func", topic, reflect.TypeOf(fn).Kind())
+		return eventHandler{}, fmt.Errorf("topic %s: %s is not of type reflect.Func", topic, reflect.TypeOf(fn).Kind())
 	}
 	if reflect.Type.NumIn(reflect.TypeOf(fn)) == 0 {
-		return nil, fmt.Errorf("topic %s: function must have at least one parameter", topic)
+		return eventHandler{}, fmt.Errorf("topic %s: function must have at least one parameter", topic)
 	}
 	firstParam := reflect.Type.In(reflect.TypeOf(fn), 0)
 	if !firstParam.Implements(ctxType) {
-		return nil, fmt.Errorf("topic %s: function's first parameter must implement %s, not %s",
+		return eventHandler{}, fmt.Errorf("topic %s: function's first parameter must implement %s, not %s",
 			topic,
 			ctxType.Name(),
 			firstParam.Name())
 	}
 
 	// Wrap it up.
-	return &eventHandler{
+	return eventHandler{
 		topic:    topic,
 		callBack: reflect.ValueOf(fn),
 		flagOnce: once,
