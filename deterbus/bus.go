@@ -82,8 +82,7 @@ func New() *Bus {
 				//}
 				//eb.eventWatcher.L.Unlock()
 
-				ev := eb.pop()
-				<-processEvent(&eb, ev)
+				<-processEvent(&eb)
 			}
 		}
 	}()
@@ -91,19 +90,18 @@ func New() *Bus {
 	return &eb
 }
 
-// pop obtains a lock
+// pop does not obtain a lock
 func (eb *Bus) pop() *argEvent {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
 
 	if len(eb.pendingEvents) == 0 {
 		return nil
 	}
 
-	endEventIndex := len(eb.pendingEvents) - 1
-	ev := eb.pendingEvents[endEventIndex]
-	eb.pendingEvents = eb.pendingEvents[:endEventIndex]
-	return &ev
+	first := eb.pendingEvents[0]
+	copy(eb.pendingEvents, eb.pendingEvents[1:])
+	eb.pendingEvents = eb.pendingEvents[:len(eb.pendingEvents)-1]
+
+	return &first
 }
 
 // Stop shuts down all event processing,
@@ -180,22 +178,23 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 }
 
 // processEvent obtains a lock.
-func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
+func processEvent(eb *Bus) <-chan interface{} {
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
 	done := make(chan interface{})
 	defer close(done)
+
+	ev := eb.pop()
 
 	if ev == nil {
 		return done
 	}
-
-	eb.queueLocker.Lock()
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
 
 	// If there are no listeners, just quit.
 	if !ok || len(listeners) == 0 {
-		eb.queueLocker.Unlock()
 		return done
 	}
 
@@ -233,12 +232,13 @@ func processEvent(eb *Bus, ev *argEvent) <-chan interface{} {
 
 	// Mark that the event is done.
 	eb.queueLocker.Lock()
+
 	eb.eventWatcher.L.Lock()
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
 	eb.eventWatcher.L.Unlock()
 	close(ev.finished)
-	eb.queueLocker.Unlock()
+
 	return done
 }
 

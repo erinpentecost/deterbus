@@ -52,19 +52,18 @@ func TestSubscribe(t *testing.T) {
 	assert.Equal(t, nil, err)
 }
 
-func TestAsyncPublish(t *testing.T) {
-	b := deterbus.New()
-	defer b.Stop()
+func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
 
-	count := 1000
-
+	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
 
 	handler := func(ctx context.Context, id int) {
+		pubsLocker.Lock()
 		pubsSeen = append(pubsSeen, id)
+		pubsLocker.Unlock()
 	}
 
-	s, er := b.Subscribe(dummyTopicA, false, handler)
+	s, er := b.Subscribe(topic, false, handler)
 
 	assert.Equal(t, nil, er)
 
@@ -73,12 +72,12 @@ func TestAsyncPublish(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(count)
 	for i := 0; i < count; i++ {
-		go func() {
+		go func(id int) {
 			defer wg.Done()
-			p, er := b.Publish(context.Background(), dummyTopicA, i)
+			p, er := b.Publish(context.Background(), topic, id)
 			assert.Equal(t, nil, er)
 			<-p
-		}()
+		}(i)
 	}
 
 	wg.Wait()
@@ -90,4 +89,29 @@ func TestAsyncPublish(t *testing.T) {
 	for i := 0; i < count; i++ {
 		assert.Equal(t, i, pubsSeen[i])
 	}
+}
+
+func TestAsyncPublishSingleSubscriber(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	sendAsync(t, b, 0, 2000)
+}
+
+func TestAsyncPublishManySubscribers(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	topicCount := 1000
+	var wg sync.WaitGroup
+	wg.Add(topicCount)
+
+	for i := 0; i < topicCount; i++ {
+		go func(topic int) {
+			defer wg.Done()
+			sendAsync(t, b, topic, 5)
+		}(i)
+	}
+
+	wg.Wait()
 }
