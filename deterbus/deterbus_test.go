@@ -1,6 +1,7 @@
 package deterbus_test
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"sync"
@@ -113,6 +114,40 @@ func TestAsyncPublishManySubscribers(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestContextPublish(t *testing.T) {
+	bus := deterbus.New()
+	defer bus.Stop()
+
+	foundTopic := int(-1)
+	foundNum := uint64(4444)
+
+	expectedTopic := int(999)
+
+	handler := func(ctx context.Context) {
+		foundTopic = ctx.Value(deterbus.EventTopic).(int)
+		foundNum = ctx.Value(deterbus.EventNumber).(uint64)
+	}
+
+	s, _ := bus.Subscribe(expectedTopic, handler)
+
+	<-s
+
+	p, _ := bus.Publish(expectedTopic, context.Background())
+	<-p
+
+	assert.Equal(t, expectedTopic, foundTopic)
+	assert.Equal(t, 1, foundNum)
+}
+
+func TestPublishWithNoSubscriber(t *testing.T) {
+	bus := deterbus.New()
+	defer bus.Stop()
+
+	// This should complete and not time out.
+	p, _ := bus.Publish(9999, 3423)
+	<-p
 }
 
 func BenchmarkAsyncPublish(b *testing.B) {

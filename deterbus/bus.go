@@ -157,11 +157,12 @@ func publishNormal(eb *Bus, topic interface{}, args ...interface{}) (<-chan inte
 	eb.publishedNumber = pubNum
 	eb.eventWatcher.L.Unlock()
 
-	// TODO: add on context values if first arg is a context.
-	/*
-		ctx: context.WithValue(
-				context.WithValue(ctx, EventTopic, topic), EventNumber, pubNum),
-	*/
+	//  Add on context values if first arg is a context.
+	if (len(args) > 0) && (reflect.TypeOf(args[0]) == ctxType) {
+		args[0] = context.WithValue(
+			context.WithValue(
+				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, topic), EventNumber, pubNum)
+	}
 
 	ev := argEvent{
 		topic:       topic,
@@ -197,6 +198,7 @@ func processEvent(eb *Bus) <-chan interface{} {
 	}
 
 	ev := eb.pendingEvents.Remove().(argEvent)
+	defer close(ev.finished)
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
@@ -247,7 +249,6 @@ func processEvent(eb *Bus) <-chan interface{} {
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
 	eb.eventWatcher.L.Unlock()
-	close(ev.finished)
 
 	return done
 }
