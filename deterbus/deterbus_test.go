@@ -102,7 +102,7 @@ func TestAsyncPublishManySubscribers(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	topicCount := 1000
+	topicCount := 500
 	var wg sync.WaitGroup
 	wg.Add(topicCount)
 

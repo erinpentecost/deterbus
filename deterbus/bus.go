@@ -31,8 +31,9 @@ type Bus struct {
 	consumedNumber  uint64
 	pendingEvents   []argEvent
 	listeners       map[interface{}]([]*eventHandler)
+	publishBuffer   chan argEvent
+	publishMethod   func(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
 	done            chan interface{}
-	draining        bool
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
 }
@@ -44,7 +45,8 @@ func New() *Bus {
 		consumedNumber:  0,
 		pendingEvents:   make([]argEvent, 0),
 		listeners:       make(map[interface{}]([]*eventHandler)),
-		draining:        false,
+		publishBuffer:   make(chan argEvent),
+		publishMethod:   publishNormal,
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
 		eventWatcher:    sync.NewCond(&sync.Mutex{}),
@@ -65,6 +67,27 @@ func New() *Bus {
 
 	eb.listeners[subscribeEvent] = []*eventHandler{&subHandler}
 	eb.listeners[unsubscribeEvent] = []*eventHandler{&unsubHandler}
+
+	// Start publish buffer channel
+	go func() {
+		for {
+			select {
+			case <-eb.done:
+				return
+			default:
+				// TODO: Suspend the go routine instead of
+				// spinwaiting.
+				// Loop while events are available.
+				//eb.eventWatcher.L.Lock()
+				//for eb.consumedNumber > eb.publishedNumber {
+				//	eb.eventWatcher.Wait()
+				//}
+				//eb.eventWatcher.L.Unlock()
+
+				<-processEvent(&eb)
+			}
+		}
+	}()
 
 	// Start consumer.
 	go func() {
@@ -121,7 +144,7 @@ func (eb *Bus) Stop() {
 // since events will be dropped while draining.
 func (eb *Bus) DrainStop() <-chan interface{} {
 	eb.queueLocker.Lock()
-	eb.draining = true
+	eb.publishMethod = publishDraining
 	eb.queueLocker.Unlock()
 
 	done := make(chan interface{})
@@ -146,15 +169,17 @@ func (eb *Bus) DrainStop() <-chan interface{} {
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
-	done := make(chan interface{})
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
+	return eb.publishMethod(ctx, eb, topic, args...)
+}
 
-	// Quit early if we are draining.
-	if eb.draining {
-		close(done)
-		return done, errors.New("bus is draining")
-	}
+func publishDraining(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+	done := make(chan interface{})
+	close(done)
+	return done, errors.New("bus is draining")
+}
+
+func publishNormal(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+	done := make(chan interface{})
 
 	// Create the event we need to send.
 	eb.eventWatcher.L.Lock()
@@ -172,6 +197,10 @@ func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface
 		finished:    done,
 	}
 
+	// This results in unmanaged locking of the entire
+	// eventbus and starves the consumer.
+	eb.queueLocker.Lock()
+	defer eb.queueLocker.Unlock()
 	eb.pendingEvents = append(eb.pendingEvents, ev)
 
 	return done, nil
