@@ -1,7 +1,6 @@
 package deterbus_test
 
 import (
-	"context"
 	"reflect"
 	"sort"
 	"sync"
@@ -43,7 +42,7 @@ func TestSubscribe(t *testing.T) {
 
 	receiveCount := 0
 
-	handler := func(ctx context.Context) {
+	handler := func() {
 		receiveCount++
 	}
 
@@ -57,7 +56,7 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
 	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
 
-	handler := func(ctx context.Context, id int) {
+	handler := func(id int) {
 		pubsLocker.Lock()
 		pubsSeen = append(pubsSeen, id)
 		pubsLocker.Unlock()
@@ -74,7 +73,7 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
 	for i := 0; i < count; i++ {
 		go func(id int) {
 			defer wg.Done()
-			p, er := b.Publish(context.Background(), topic, id)
+			p, er := b.Publish(topic, id)
 			assert.Equal(t, nil, er)
 			<-p
 		}(i)
@@ -102,16 +101,36 @@ func TestAsyncPublishManySubscribers(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	topicCount := 500
+	topicCount := 2000
 	var wg sync.WaitGroup
 	wg.Add(topicCount)
 
 	for i := 0; i < topicCount; i++ {
 		go func(topic int) {
 			defer wg.Done()
-			sendAsync(t, b, topic, 5)
+			sendAsync(t, b, topic, 100)
 		}(i)
 	}
 
 	wg.Wait()
+}
+
+func BenchmarkAsyncPublish(b *testing.B) {
+	bus := deterbus.New()
+	defer bus.Stop()
+
+	handler := func() uint64 {
+		// no op
+		//return ctx.Value(deterbus.EventNumber).(uint64)
+		return 34
+	}
+
+	s, _ := bus.Subscribe(0, handler)
+
+	<-s
+
+	for n := 0; n < b.N; n++ {
+		p, _ := bus.Publish(0)
+		<-p
+	}
 }

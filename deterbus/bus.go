@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sync"
 
@@ -34,7 +35,7 @@ type Bus struct {
 	consumedNumber  uint64
 	pendingEvents   *queue.Queue
 	listeners       map[interface{}]([]*eventHandler)
-	publishMethod   func(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
+	publishMethod   func(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
 	done            chan interface{}
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
@@ -130,17 +131,24 @@ func (eb *Bus) DrainStop() <-chan interface{} {
 // followed by args.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) Publish(ctx context.Context, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
-	return eb.publishMethod(ctx, eb, topic, args...)
+func (eb *Bus) Publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+	return eb.publishMethod(eb, topic, args...)
 }
 
-func publishDraining(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func publishDraining(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 	close(done)
 	return done, errors.New("bus is draining")
 }
 
-func publishNormal(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+// Store reflected type of context
+var ctxType reflect.Type
+
+func init() {
+	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
+}
+
+func publishNormal(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 
 	// I need to claim the publish number before adding to queue
@@ -149,10 +157,14 @@ func publishNormal(ctx context.Context, eb *Bus, topic interface{}, args ...inte
 	eb.publishedNumber = pubNum
 	eb.eventWatcher.L.Unlock()
 
-	ev := argEvent{
-		topic: topic,
+	// TODO: add on context values if first arg is a context.
+	/*
 		ctx: context.WithValue(
-			context.WithValue(ctx, EventTopic, topic), EventNumber, pubNum),
+				context.WithValue(ctx, EventTopic, topic), EventNumber, pubNum),
+	*/
+
+	ev := argEvent{
+		topic:       topic,
 		args:        args,
 		eventNumber: pubNum,
 		finished:    done,
@@ -244,7 +256,6 @@ func processEvent(eb *Bus) <-chan interface{} {
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
-// fn should be a function whose first parameter is a context.Context.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
 func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
@@ -257,7 +268,6 @@ func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{},
 // yet.
 // Once indicates that the handler should unsubcribe after
 // receiving its first call.
-// fn should be a function whose first parameter is a context.Context.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
 func (eb *Bus) SubscribeOnce(topic interface{}, fn interface{}) (<-chan interface{}, error) {
@@ -290,11 +300,11 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 	}
 	eb.queueLocker.Unlock()
 
-	return eb.Publish(context.Background(), subscribeEvent, eb, evh)
+	return eb.Publish(subscribeEvent, eb, evh)
 }
 
 // This is the subscribe handler.
-func subscribe(ctx context.Context, eb *Bus, evh eventHandler) {
+func subscribe(eb *Bus, evh eventHandler) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
@@ -309,11 +319,11 @@ func subscribe(ctx context.Context, eb *Bus, evh eventHandler) {
 // This function returns a channel indicating when the unsubscribe
 // has taken effect.
 func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
-	return eb.Publish(context.Background(), unsubscribeEvent, eb, topic, fn)
+	return eb.Publish(unsubscribeEvent, eb, topic, fn)
 }
 
 // This is the unsubscribe handler.
-func unsubscribe(ctx context.Context, eb *Bus, topic interface{}, fn interface{}) {
+func unsubscribe(eb *Bus, topic interface{}, fn interface{}) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
