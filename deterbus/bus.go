@@ -244,12 +244,27 @@ func processEvent(eb *Bus) <-chan interface{} {
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
-// once indicates that the handler should unsubcribe after
+// fn should be a function whose first parameter is a context.Context.
+// This function returns a channel indicating when the subscribe has
+// taken effect, or an error if the params were incorrect.
+func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
+	return eb.subscribeImplementation(topic, false, fn)
+}
+
+// SubscribeOnce adds a new handler for the given topic.
+// Subcription is actually an event, so you don't need to
+// worry about receiving events that haven't started processing
+// yet.
+// Once indicates that the handler should unsubcribe after
 // receiving its first call.
 // fn should be a function whose first parameter is a context.Context.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan interface{}, error) {
+func (eb *Bus) SubscribeOnce(topic interface{}, fn interface{}) (<-chan interface{}, error) {
+	return eb.subscribeImplementation(topic, true, fn)
+}
+
+func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interface{}) (<-chan interface{}, error) {
 	evh, err := newHandler(topic, once, fn)
 	if err != nil {
 		done := make(chan interface{})
@@ -278,6 +293,7 @@ func (eb *Bus) Subscribe(topic interface{}, once bool, fn interface{}) (<-chan i
 	return eb.Publish(context.Background(), subscribeEvent, eb, evh)
 }
 
+// This is the subscribe handler.
 func subscribe(ctx context.Context, eb *Bus, evh eventHandler) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
@@ -296,6 +312,7 @@ func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) (<-chan interface{
 	return eb.Publish(context.Background(), unsubscribeEvent, eb, topic, fn)
 }
 
+// This is the unsubscribe handler.
 func unsubscribe(ctx context.Context, eb *Bus, topic interface{}, fn interface{}) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()

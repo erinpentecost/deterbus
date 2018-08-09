@@ -47,7 +47,7 @@ func TestSubscribe(t *testing.T) {
 		receiveCount++
 	}
 
-	done, err := b.Subscribe(dummyTopicA, false, handler)
+	done, err := b.Subscribe(dummyTopicA, handler)
 	<-done
 	assert.Equal(t, nil, err)
 }
@@ -63,7 +63,7 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
 		pubsLocker.Unlock()
 	}
 
-	s, er := b.Subscribe(topic, false, handler)
+	s, er := b.Subscribe(topic, handler)
 
 	assert.Equal(t, nil, er)
 
