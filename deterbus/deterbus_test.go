@@ -138,7 +138,9 @@ func TestContextPublish(t *testing.T) {
 	<-p
 
 	assert.Equal(t, expectedTopic, foundTopic)
-	assert.Equal(t, 1, foundNum)
+	// we should be on the second publish, because
+	// a publish is internally treated as a publish
+	assert.Equal(t, uint64(2), foundNum)
 }
 
 func TestPublishWithNoSubscriber(t *testing.T) {

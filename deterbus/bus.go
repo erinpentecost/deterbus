@@ -145,7 +145,7 @@ func publishDraining(eb *Bus, topic interface{}, args ...interface{}) (<-chan in
 var ctxType reflect.Type
 
 func init() {
-	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
+	ctxType = reflect.TypeOf(context.TODO())
 }
 
 func publishNormal(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
