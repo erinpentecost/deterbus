@@ -78,12 +78,6 @@ func New() *Bus {
 			default:
 				// TODO: Suspend the go routine instead of
 				// spinwaiting.
-				// Loop while events are available.
-				//eb.eventWatcher.L.Lock()
-				//for eb.consumedNumber > eb.publishedNumber {
-				//	eb.eventWatcher.Wait()
-				//}
-				//eb.eventWatcher.L.Unlock()
 
 				<-processEvent(&eb)
 				// Yield thread, since this spins forever.
@@ -226,7 +220,7 @@ func processEvent(eb *Bus) <-chan interface{} {
 	}
 
 	// Unlock queue early so publishers can add to it
-	// while we spin on the listeners.
+	// while we suspend for the listeners.
 	eb.queueLocker.Unlock()
 
 	// Wait until all listeners are done.
