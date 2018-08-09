@@ -9,6 +9,7 @@ go_library(
     ],
     importpath = "github.com/erinpentecost/deterbus/deterbus",
     visibility = ["//visibility:public"],
+    deps = ["//vendor/github.com/eapache/queue:go_default_library"],
 )
 
 go_test(

@@ -51,3 +51,9 @@ go_repository(
     commit = "f35b8ab0b5a2cef36673838d662e249dd9c94686",
     importpath = "github.com/stretchr/testify",
 )
+
+go_repository(
+    name = "com_github_eapache_queue",
+    commit = "44cc805cf13205b55f69e14bcb69867d1ae92f98",
+    importpath = "github.com/eapache/queue",
+)

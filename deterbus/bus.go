@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+
+	"github.com/eapache/queue"
 )
 
 type metaEvent int
@@ -29,7 +32,7 @@ const (
 type Bus struct {
 	publishedNumber uint64
 	consumedNumber  uint64
-	pendingEvents   []argEvent
+	pendingEvents   *queue.Queue
 	listeners       map[interface{}]([]*eventHandler)
 	publishBuffer   chan argEvent
 	publishMethod   func(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
@@ -43,7 +46,7 @@ func New() *Bus {
 	eb := Bus{
 		publishedNumber: 0,
 		consumedNumber:  0,
-		pendingEvents:   make([]argEvent, 0),
+		pendingEvents:   queue.New(),
 		listeners:       make(map[interface{}]([]*eventHandler)),
 		publishBuffer:   make(chan argEvent),
 		publishMethod:   publishNormal,
@@ -106,25 +109,13 @@ func New() *Bus {
 				//eb.eventWatcher.L.Unlock()
 
 				<-processEvent(&eb)
+				// Yield thread, since this spins forever.
+				runtime.Gosched()
 			}
 		}
 	}()
 
 	return &eb
-}
-
-// pop does not obtain a lock
-func (eb *Bus) pop() *argEvent {
-
-	if len(eb.pendingEvents) == 0 {
-		return nil
-	}
-
-	first := eb.pendingEvents[0]
-	copy(eb.pendingEvents, eb.pendingEvents[1:])
-	eb.pendingEvents = eb.pendingEvents[:len(eb.pendingEvents)-1]
-
-	return &first
 }
 
 // Stop shuts down all event processing,
@@ -181,11 +172,10 @@ func publishDraining(ctx context.Context, eb *Bus, topic interface{}, args ...in
 func publishNormal(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 
-	// Create the event we need to send.
+	// I need to claim the publish number before adding to queue
 	eb.eventWatcher.L.Lock()
 	pubNum := eb.publishedNumber + 1
 	eb.publishedNumber = pubNum
-	eb.eventWatcher.Broadcast()
 	eb.eventWatcher.L.Unlock()
 
 	ev := argEvent{
@@ -201,7 +191,13 @@ func publishNormal(ctx context.Context, eb *Bus, topic interface{}, args ...inte
 	// eventbus and starves the consumer.
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
-	eb.pendingEvents = append(eb.pendingEvents, ev)
+	eb.pendingEvents.Add(ev)
+
+	// Broadcast the publish count change AFTER adding the event to the queue.
+	// I want to make sure data is available when I send the signal.
+	eb.eventWatcher.L.Lock()
+	eb.eventWatcher.Broadcast()
+	eb.eventWatcher.L.Unlock()
 
 	return done, nil
 }
@@ -213,11 +209,11 @@ func processEvent(eb *Bus) <-chan interface{} {
 	done := make(chan interface{})
 	defer close(done)
 
-	ev := eb.pop()
-
-	if ev == nil {
+	if eb.pendingEvents.Length() == 0 {
 		return done
 	}
+
+	ev := eb.pendingEvents.Remove().(argEvent)
 
 	// Find the listeners for it
 	listeners, ok := eb.listeners[ev.topic]
@@ -262,6 +258,8 @@ func processEvent(eb *Bus) <-chan interface{} {
 	// Mark that the event is done.
 	eb.queueLocker.Lock()
 
+	// Publish the signal AFTER the event is handled
+	// and removed from the queue, while a lock still exists.
 	eb.eventWatcher.L.Lock()
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
