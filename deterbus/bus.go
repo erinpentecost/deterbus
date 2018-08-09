@@ -34,7 +34,6 @@ type Bus struct {
 	consumedNumber  uint64
 	pendingEvents   *queue.Queue
 	listeners       map[interface{}]([]*eventHandler)
-	publishBuffer   chan argEvent
 	publishMethod   func(ctx context.Context, eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
 	done            chan interface{}
 	queueLocker     *sync.Mutex
@@ -48,7 +47,6 @@ func New() *Bus {
 		consumedNumber:  0,
 		pendingEvents:   queue.New(),
 		listeners:       make(map[interface{}]([]*eventHandler)),
-		publishBuffer:   make(chan argEvent),
 		publishMethod:   publishNormal,
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
@@ -70,27 +68,6 @@ func New() *Bus {
 
 	eb.listeners[subscribeEvent] = []*eventHandler{&subHandler}
 	eb.listeners[unsubscribeEvent] = []*eventHandler{&unsubHandler}
-
-	// Start publish buffer channel
-	go func() {
-		for {
-			select {
-			case <-eb.done:
-				return
-			default:
-				// TODO: Suspend the go routine instead of
-				// spinwaiting.
-				// Loop while events are available.
-				//eb.eventWatcher.L.Lock()
-				//for eb.consumedNumber > eb.publishedNumber {
-				//	eb.eventWatcher.Wait()
-				//}
-				//eb.eventWatcher.L.Unlock()
-
-				<-processEvent(&eb)
-			}
-		}
-	}()
 
 	// Start consumer.
 	go func() {
