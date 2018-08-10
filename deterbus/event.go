@@ -8,10 +8,11 @@ import (
 // eventHandler is a container around a function and metadata for
 // that function.
 type eventHandler struct {
-	topic    interface{}
-	callBack reflect.Value
-	flagOnce bool
-	shape    reflect.Type
+	topic      interface{}
+	callBack   reflect.Value
+	flagOnce   bool
+	shape      reflect.Type
+	subscriber string
 }
 
 // argEvent is the args passed into eventHandler.
@@ -37,7 +38,7 @@ func (evh *eventHandler) call(params []reflect.Value) {
 	evh.callBack.Call(params)
 }
 
-func newHandler(topic interface{}, once bool, fn interface{}) (eventHandler, error) {
+func newHandler(topic interface{}, once bool, trace string, fn interface{}) (eventHandler, error) {
 
 	// Verify input.
 	if reflect.TypeOf(fn).Kind() != reflect.Func {
@@ -46,9 +47,10 @@ func newHandler(topic interface{}, once bool, fn interface{}) (eventHandler, err
 
 	// Wrap it up.
 	return eventHandler{
-		topic:    topic,
-		callBack: reflect.ValueOf(fn),
-		flagOnce: once,
-		shape:    reflect.TypeOf(fn),
+		topic:      topic,
+		callBack:   reflect.ValueOf(fn),
+		flagOnce:   once,
+		shape:      reflect.TypeOf(fn),
+		subscriber: trace,
 	}, nil
 }

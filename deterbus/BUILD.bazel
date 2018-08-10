@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "bus.go",
         "event.go",
+        "subscriberPanic.go",
     ],
     importpath = "github.com/erinpentecost/deterbus/deterbus",
     visibility = ["//visibility:public"],

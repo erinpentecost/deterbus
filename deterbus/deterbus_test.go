@@ -143,6 +143,40 @@ func TestContextPublish(t *testing.T) {
 	assert.Equal(t, uint64(2), foundNum)
 }
 
+func TestPanicPublish(t *testing.T) {
+	bus := deterbus.New()
+	defer bus.Stop()
+
+	expectedTopic := int(999)
+	panicker := func() {
+		panic("Oh no, I broke!")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var sp deterbus.SubscriberPanic
+
+	intercepter := func(s deterbus.SubscriberPanic) {
+		sp = s
+		wg.Done()
+	}
+
+	s, _ := bus.Subscribe(expectedTopic, panicker)
+	p, _ := bus.SubscribeToPanic(intercepter)
+
+	<-s
+	<-p
+
+	pub, _ := bus.Publish(expectedTopic, context.Background())
+	<-pub
+
+	wg.Wait()
+	bus.DrainStop()
+
+	assert.NotEqual(t, nil, sp)
+	assert.Equal(t, expectedTopic, sp.Topic())
+}
+
 func TestPublishWithNoSubscriber(t *testing.T) {
 	bus := deterbus.New()
 	defer bus.Stop()

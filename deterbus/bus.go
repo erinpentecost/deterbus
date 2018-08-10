@@ -16,6 +16,7 @@ type metaEvent int
 const (
 	subscribeEvent metaEvent = iota
 	unsubscribeEvent
+	errorEvent
 )
 
 // CtxKey is used to prevent collisions on additions
@@ -57,9 +58,10 @@ func New() *Bus {
 	// Subscribe and Unsubscribe are treated as events.
 	// This helps make the whole thing more deterministic.
 	// But to get this to work, we need to bootstrap them in.
-	subHandler, subErr := newHandler(subscribeEvent, false, subscribe)
-	unsubHandler, unsubErr := newHandler(unsubscribeEvent, false, unsubscribe)
+	subHandler, subErr := newHandler(subscribeEvent, false, "contructor", subscribe)
+	unsubHandler, unsubErr := newHandler(unsubscribeEvent, false, "constructor", unsubscribe)
 
+	// These really shouldn't cause any errors.
 	if subErr != nil {
 		panic(subErr)
 	}
@@ -225,6 +227,19 @@ func processEvent(eb *Bus) <-chan interface{} {
 		// Actually invoke the listener.
 		go func(l *eventHandler) {
 			defer lwg.Done()
+
+			// Catch panics.
+			defer func() {
+				if r := recover(); r != nil {
+					eb.Publish(errorEvent, SubscriberPanic{
+						internal:      r,
+						topic:         ev.topic,
+						publishNumber: ev.eventNumber,
+						subscriber:    l.subscriber,
+					})
+				}
+			}()
+
 			l.call(params)
 		}(listener)
 		// Remove it from the list if needed.
@@ -253,6 +268,12 @@ func processEvent(eb *Bus) <-chan interface{} {
 	return done
 }
 
+// SubscribeToPanic lets you handle panics called by your callback
+// functions.
+func (eb *Bus) SubscribeToPanic(fn func(SubscriberPanic)) (<-chan interface{}, error) {
+	return eb.subscribeImplementation(errorEvent, false, fn)
+}
+
 // Subscribe adds a new handler for the given topic.
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
@@ -276,7 +297,14 @@ func (eb *Bus) SubscribeOnce(topic interface{}, fn interface{}) (<-chan interfac
 }
 
 func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interface{}) (<-chan interface{}, error) {
-	evh, err := newHandler(topic, once, fn)
+	// Store information on caller.
+	_, callerFile, callerLine, ok := runtime.Caller(2)
+	callerMsg := "unknown"
+	if ok {
+		callerMsg = fmt.Sprintf("%s [%v]", callerFile, callerLine)
+	}
+
+	evh, err := newHandler(topic, once, callerMsg, fn)
 	if err != nil {
 		done := make(chan interface{})
 		defer close(done)
