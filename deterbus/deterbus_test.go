@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -145,11 +146,11 @@ func TestContextPublish(t *testing.T) {
 
 func TestPanicPublish(t *testing.T) {
 	bus := deterbus.New()
-	defer bus.Stop()
 
 	expectedTopic := int(999)
+	expectedPanicContent := "Oh no, I broke!"
 	panicker := func() {
-		panic("Oh no, I broke!")
+		panic(expectedPanicContent)
 	}
 
 	var wg sync.WaitGroup
@@ -167,7 +168,7 @@ func TestPanicPublish(t *testing.T) {
 	<-s
 	<-p
 
-	pub, _ := bus.Publish(expectedTopic, context.Background())
+	pub, _ := bus.Publish(expectedTopic)
 	<-pub
 
 	wg.Wait()
@@ -175,6 +176,10 @@ func TestPanicPublish(t *testing.T) {
 
 	assert.NotEqual(t, nil, sp)
 	assert.Equal(t, expectedTopic, sp.Topic())
+	assert.Equal(t, expectedPanicContent, sp.Panic().(string))
+
+	assert.True(t, strings.Contains(sp.Error(), "subscriber for topic "))
+	assert.True(t, strings.Contains(sp.Subscriber(), "deterbus_test"))
 }
 
 func TestPublishWithNoSubscriber(t *testing.T) {

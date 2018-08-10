@@ -13,11 +13,15 @@ type SubscriberPanic struct {
 }
 
 func (se *SubscriberPanic) Error() string {
-	return fmt.Sprintf("subscriber for topic %s at %s on event number %v returned an error: %s",
+	return fmt.Sprintf("subscriber for topic %s at %s on event number %v panicked",
 		se.topic,
 		se.subscriber,
-		se.publishNumber,
-		se.internal)
+		se.publishNumber)
+}
+
+// Panic is the panic that caused the interception.
+func (se *SubscriberPanic) Panic() interface{} {
+	return se.internal
 }
 
 // Topic that the callback was handling.
