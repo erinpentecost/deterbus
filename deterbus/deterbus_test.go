@@ -191,6 +191,50 @@ func TestPublishWithNoSubscriber(t *testing.T) {
 	<-p
 }
 
+func TestPublishMultipleSubscribers(t *testing.T) {
+	bus := deterbus.New()
+
+	subCount := 100
+	pubCount := 400
+
+	topic := 98
+
+	var resLock sync.Mutex
+	res := make(map[int]int)
+
+	pan, _ := bus.SubscribeToPanic(func(sp deterbus.SubscriberPanic) {
+		assert.FailNow(t, "callback panic")
+	})
+	<-pan
+
+	for i := 0; i < subCount; i++ {
+		s, er := bus.Subscribe(topic, func(locker *sync.Mutex, resmap map[int]int) {
+			locker.Lock()
+			defer locker.Unlock()
+			v, ok := resmap[i]
+			if ok {
+				resmap[i] = v + 1
+			} else {
+				resmap[i] = 1
+			}
+		})
+		assert.Nil(t, er, "subscribe failed")
+		<-s
+	}
+
+	for p := 0; p < pubCount; p++ {
+		d, _ := bus.Publish(topic, &resLock, res)
+		<-d
+	}
+
+	<-bus.DrainStop()
+
+	for i := 0; i < subCount; i++ {
+		_, ok := res[i]
+		assert.True(t, ok, "missing handler responses")
+	}
+}
+
 func BenchmarkAsyncPublish(b *testing.B) {
 	bus := deterbus.New()
 	defer bus.Stop()

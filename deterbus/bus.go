@@ -269,7 +269,7 @@ func processEvent(eb *Bus) <-chan interface{} {
 }
 
 // SubscribeToPanic lets you handle panics called by your callback
-// functions.
+// functions. This can be useful for logging.
 func (eb *Bus) SubscribeToPanic(fn func(SubscriberPanic)) (<-chan interface{}, error) {
 	return eb.subscribeImplementation(errorEvent, false, fn)
 }
