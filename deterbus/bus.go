@@ -228,9 +228,10 @@ func processEvent(eb *Bus) <-chan interface{} {
 		go func(l *eventHandler) {
 			defer lwg.Done()
 
-			// Catch panics.
+			// Catch panics, but not if this panic is from
+			// a panic handler itself.
 			defer func() {
-				if r := recover(); r != nil {
+				if r := recover(); (r != nil) && (ev.topic != errorEvent) {
 					eb.Publish(errorEvent, SubscriberPanic{
 						internal:      r,
 						topic:         ev.topic,

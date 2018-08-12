@@ -2,6 +2,7 @@ package deterbus_test
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -207,23 +208,31 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	})
 	<-pan
 
+	var wg sync.WaitGroup
+	wg.Add(subCount)
 	for i := 0; i < subCount; i++ {
-		s, er := bus.Subscribe(topic, func(locker *sync.Mutex, resmap map[int]int) {
-			locker.Lock()
-			defer locker.Unlock()
-			v, ok := resmap[i]
-			if ok {
-				resmap[i] = v + 1
-			} else {
-				resmap[i] = 1
-			}
-		})
-		assert.Nil(t, er, "subscribe failed")
-		<-s
+		go func(handlerid int) {
+			defer wg.Done()
+			s, er := bus.Subscribe(topic, func(locker *sync.Mutex, resmap *map[int]int) {
+				locker.Lock()
+				defer locker.Unlock()
+				v, ok := (*resmap)[handlerid]
+				if ok {
+					(*resmap)[handlerid] = v + 1
+				} else {
+					(*resmap)[handlerid] = 1
+				}
+			})
+			assert.Nil(t, er, "subscribe failed")
+			<-s
+		}(i)
 	}
 
+	wg.Wait()
+
 	for p := 0; p < pubCount; p++ {
-		d, _ := bus.Publish(topic, &resLock, res)
+		d, er := bus.Publish(topic, &resLock, &res)
+		assert.Nil(t, er, "publish failed")
 		<-d
 	}
 
@@ -231,7 +240,7 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 
 	for i := 0; i < subCount; i++ {
 		_, ok := res[i]
-		assert.True(t, ok, "missing handler responses")
+		assert.True(t, ok, fmt.Sprintf("missing handler responses for handler %v", i))
 	}
 }
 
