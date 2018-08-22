@@ -141,7 +141,7 @@ func TestContextPublish(t *testing.T) {
 
 	assert.Equal(t, expectedTopic, foundTopic)
 	// we should be on the second publish, because
-	// a publish is internally treated as a publish
+	// a subscribe is internally treated as a publish
 	assert.Equal(t, uint64(2), foundNum)
 }
 
@@ -244,13 +244,13 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	}
 }
 
+// BenchmarkAsyncPublish tests one publish vs one subscriber speed.
 func BenchmarkAsyncPublish(b *testing.B) {
 	bus := deterbus.New()
 	defer bus.Stop()
 
 	handler := func() uint64 {
 		// no op
-		//return ctx.Value(deterbus.EventNumber).(uint64)
 		return 34
 	}
 

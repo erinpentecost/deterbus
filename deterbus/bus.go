@@ -195,10 +195,12 @@ func processEvent(eb *Bus) <-chan interface{} {
 	done := make(chan interface{})
 	defer close(done)
 
+	// Quit if there are no events.
 	if eb.pendingEvents.Length() == 0 {
 		return done
 	}
 
+	// Pop off the first event.
 	ev := eb.pendingEvents.Remove().(argEvent)
 	defer close(ev.finished)
 
@@ -207,6 +209,12 @@ func processEvent(eb *Bus) <-chan interface{} {
 
 	// If there are no listeners, just quit.
 	if !ok || len(listeners) == 0 {
+		// Publish the signal AFTER the event is handled
+		// and removed from the queue, while a lock still exists.
+		eb.eventWatcher.L.Lock()
+		eb.consumedNumber = ev.eventNumber
+		eb.eventWatcher.Broadcast()
+		eb.eventWatcher.L.Unlock()
 		return done
 	}
 
@@ -256,15 +264,15 @@ func processEvent(eb *Bus) <-chan interface{} {
 	// Wait until all listeners are done.
 	lwg.Wait()
 
-	// Mark that the event is done.
-	eb.queueLocker.Lock()
-
 	// Publish the signal AFTER the event is handled
 	// and removed from the queue, while a lock still exists.
 	eb.eventWatcher.L.Lock()
 	eb.consumedNumber = ev.eventNumber
 	eb.eventWatcher.Broadcast()
 	eb.eventWatcher.L.Unlock()
+
+	// Mark that the event is done.
+	eb.queueLocker.Lock()
 
 	return done
 }
