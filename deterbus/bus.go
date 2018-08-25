@@ -108,6 +108,8 @@ func (eb *Bus) Stop() {
 // Only call this when you are destroying the object,
 // since events will be dropped while draining.
 func (eb *Bus) DrainStop() <-chan interface{} {
+
+	// Stop accepting new events
 	eb.queueLocker.Lock()
 	eb.publishMethod = publishDraining
 	eb.queueLocker.Unlock()
@@ -122,7 +124,27 @@ func (eb *Bus) DrainStop() <-chan interface{} {
 			eb.eventWatcher.Wait()
 		}
 		eb.eventWatcher.L.Unlock()
-		close(eb.done)
+
+		// Stop all processing.
+		eb.Stop()
+	}()
+
+	return done
+}
+
+// Wait returns a chan that will close when there
+// are no pending events that need to be processed.
+func (eb *Bus) Wait() <-chan interface{} {
+	done := make(chan interface{})
+
+	go func() {
+		defer close(done)
+		// Loop until all events are gone.
+		eb.eventWatcher.L.Lock()
+		for eb.consumedNumber < eb.publishedNumber {
+			eb.eventWatcher.Wait()
+		}
+		eb.eventWatcher.L.Unlock()
 	}()
 
 	return done

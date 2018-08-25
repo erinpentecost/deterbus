@@ -54,7 +54,7 @@ func TestSubscribe(t *testing.T) {
 	assert.Equal(t, nil, err)
 }
 
-func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
+func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) interface{} {
 
 	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
@@ -91,6 +91,22 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) {
 	for i := 0; i < count; i++ {
 		assert.Equal(t, i, pubsSeen[i])
 	}
+
+	return handler
+}
+
+func TestUnsubscribe(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	handler := sendAsync(t, b, 19, 20)
+
+	unsub, ok := b.Unsubscribe(19, handler)
+
+	<-unsub
+
+	assert.Nil(t, ok, "failure to unsubscribe")
+
 }
 
 func TestAsyncPublishSingleSubscriber(t *testing.T) {
@@ -185,7 +201,7 @@ func TestPanicPublish(t *testing.T) {
 
 func TestPublishWithNoSubscriber(t *testing.T) {
 	bus := deterbus.New()
-	defer bus.Stop()
+	defer bus.DrainStop()
 
 	// This should complete and not time out.
 	p, _ := bus.Publish(9999, 3423)
@@ -244,8 +260,8 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	}
 }
 
-// BenchmarkAsyncPublish tests one publish vs one subscriber speed.
-func BenchmarkAsyncPublish(b *testing.B) {
+// BenchmarkSinglePublish benchmarks one publish vs one subscriber.
+func BenchmarkSinglePublish(b *testing.B) {
 	bus := deterbus.New()
 	defer bus.Stop()
 
