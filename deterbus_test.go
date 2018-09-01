@@ -54,7 +54,7 @@ func TestSubscribe(t *testing.T) {
 	assert.Equal(t, nil, err)
 }
 
-func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) interface{} {
+func send(t *testing.T, b *deterbus.Bus, syncTxn bool, topic int, count int) interface{} {
 
 	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
@@ -76,9 +76,15 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) interface{} 
 	for i := 0; i < count; i++ {
 		go func(id int) {
 			defer wg.Done()
-			p, er := b.Publish(topic, id)
-			assert.Equal(t, nil, er)
-			<-p
+			if syncTxn {
+				p, er := b.PublishSync(topic, id)
+				assert.Equal(t, nil, er)
+				<-p
+			} else {
+				p, er := b.Publish(topic, id)
+				assert.Equal(t, nil, er)
+				<-p
+			}
 		}(i)
 	}
 
@@ -95,11 +101,11 @@ func sendAsync(t *testing.T, b *deterbus.Bus, topic int, count int) interface{} 
 	return handler
 }
 
-func TestUnsubscribe(t *testing.T) {
+func TestUnsubscribeAsync(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	handler := sendAsync(t, b, 19, 20)
+	handler := send(t, b, false, 19, 20)
 
 	unsub, ok := b.Unsubscribe(19, handler)
 
@@ -109,14 +115,14 @@ func TestUnsubscribe(t *testing.T) {
 
 }
 
-func TestAsyncPublishSingleSubscriber(t *testing.T) {
+func TestPublishSingleSubscriberAsync(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
-	sendAsync(t, b, 0, 2000)
+	send(t, b, false, 0, 2000)
 }
 
-func TestAsyncPublishManySubscribers(t *testing.T) {
+func TestPublishManySubscribersAsync(t *testing.T) {
 	b := deterbus.New()
 	defer b.Stop()
 
@@ -127,7 +133,46 @@ func TestAsyncPublishManySubscribers(t *testing.T) {
 	for i := 0; i < topicCount; i++ {
 		go func(topic int) {
 			defer wg.Done()
-			sendAsync(t, b, topic, 100)
+			send(t, b, false, topic, 100)
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestUnsubscribeSync(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	handler := send(t, b, true, 19, 20)
+
+	unsub, ok := b.Unsubscribe(19, handler)
+
+	<-unsub
+
+	assert.Nil(t, ok, "failure to unsubscribe")
+
+}
+
+func TestPublishSingleSubscriberSync(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	send(t, b, true, 0, 2000)
+}
+
+func TestPublishManySubscribersSync(t *testing.T) {
+	b := deterbus.New()
+	defer b.Stop()
+
+	topicCount := 2000
+	var wg sync.WaitGroup
+	wg.Add(topicCount)
+
+	for i := 0; i < topicCount; i++ {
+		go func(topic int) {
+			defer wg.Done()
+			send(t, b, true, topic, 100)
 		}(i)
 	}
 
