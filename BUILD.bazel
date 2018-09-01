@@ -1,5 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("@bazel_gazelle//:def.bzl", "gazelle")
 
 # A Gazelle executable for auto-generating Go BUILD definitions
@@ -10,3 +11,22 @@ gazelle(
 
 # Import project dependencies.
 # This is done automatically by gazelle.
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "bus.go",
+        "event.go",
+        "subscriberPanic.go",
+    ],
+    importpath = "github.com/erinpentecost/deterbus",
+    visibility = ["//visibility:public"],
+    deps = ["//vendor/github.com/eapache/queue:go_default_library"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["deterbus_test.go"],
+    embed = [":go_default_library"],
+    deps = ["//vendor/github.com/stretchr/testify/assert:go_default_library"],
+)

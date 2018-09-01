@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/erinpentecost/deterbus/deterbus"
+	"github.com/erinpentecost/deterbus"
 	"github.com/stretchr/testify/assert"
 )
 
