@@ -1,5 +1,10 @@
 # deterbus
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/erinpentecost/deterbus)](https://goreportcard.com/report/github.com/erinpentecost/deterbus)
+[![Travis CI](https://travis-ci.org/erinpentecost/deterbus.svg?branch=master)](https://travis-ci.org/erinpentecost/deterbus.svg?branch=master)
+
+
+
 deterbus is a deterministic event bus for Go. Things that make this different from other event bus implementations:
 
 * There is a single event queue for all topics. Events are processed one-at-a-time.

@@ -83,8 +83,6 @@ func New() *Bus {
 				// spinwaiting.
 
 				<-processEvent(&eb)
-				// Yield thread, since this spins forever.
-				runtime.Gosched()
 			}
 		}
 	}()
@@ -230,6 +228,9 @@ func processEvent(eb *Bus) <-chan interface{} {
 
 	// Quit if there are no events.
 	if eb.pendingEvents.Length() == 0 {
+		// Yield thread, since this spins forever.
+		runtime.Gosched()
+
 		return done
 	}
 
