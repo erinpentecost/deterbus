@@ -17,10 +17,11 @@ type eventHandler struct {
 
 // argEvent is the args passed into eventHandler.
 type argEvent struct {
-	topic       interface{}
-	args        []interface{}
-	eventNumber uint64
-	finished    chan interface{}
+	topic         interface{}
+	args          []interface{}
+	eventNumber   uint64
+	finished      chan interface{}
+	transactional bool
 }
 
 func (ev *argEvent) createParams() []reflect.Value {

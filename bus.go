@@ -36,7 +36,7 @@ type Bus struct {
 	consumedNumber  uint64
 	pendingEvents   *queue.Queue
 	listeners       map[interface{}]([]*eventHandler)
-	publishMethod   func(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error)
+	publishMethod   func(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error)
 	done            chan interface{}
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
@@ -156,10 +156,20 @@ func (eb *Bus) Wait() <-chan interface{} {
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) Publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
-	return eb.publishMethod(eb, topic, args...)
+	return eb.publishMethod(eb, topic, false, args...)
 }
 
-func publishDraining(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+// PublishSync adds an event to the queue.
+// Listeners will process the event serially and deterministically.
+// ctx is passed in as the first argument to the handler,
+// followed by args.
+// The returned channel indicates when the event
+// has been completely consumed by subscribers (if any).
+func (eb *Bus) PublishSync(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+	return eb.publishMethod(eb, topic, true, args...)
+}
+
+func publishDraining(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 	close(done)
 	return done, errors.New("bus is draining")
@@ -172,7 +182,7 @@ func init() {
 	ctxType = reflect.TypeOf(context.TODO())
 }
 
-func publishNormal(eb *Bus, topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 
 	// I need to claim the publish number before adding to queue
@@ -189,10 +199,11 @@ func publishNormal(eb *Bus, topic interface{}, args ...interface{}) (<-chan inte
 	}
 
 	ev := argEvent{
-		topic:       topic,
-		args:        args,
-		eventNumber: pubNum,
-		finished:    done,
+		topic:         topic,
+		args:          args,
+		eventNumber:   pubNum,
+		finished:      done,
+		transactional: txn,
 	}
 
 	// This results in unmanaged locking of the entire
@@ -254,8 +265,9 @@ func processEvent(eb *Bus) <-chan interface{} {
 		if listener == nil {
 			panic(fmt.Sprintf("%vth listener for %s is nil", i, ev.topic))
 		}
+
 		// Actually invoke the listener.
-		go func(l *eventHandler) {
+		invokeHndlr := func(l *eventHandler) {
 			defer lwg.Done()
 
 			// Catch panics, but not if this panic is from
@@ -272,7 +284,14 @@ func processEvent(eb *Bus) <-chan interface{} {
 			}()
 
 			l.call(params)
-		}(listener)
+		}
+
+		if ev.transactional {
+			invokeHndlr(listener)
+		} else {
+			go invokeHndlr(listener)
+		}
+
 		// Remove it from the list if needed.
 		if listener.flagOnce {
 			listeners = append(listeners[:i], listeners[i+1:]...)
