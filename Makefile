@@ -1,19 +1,11 @@
-BAZEL = bazel
-
-.PHONY: clean
-clean:
-	$(BAZEL) clean --expunge
-
 .PHONY: build
-build: clean gazelle
-	$(BAZEL) build //...
-	$(BAZEL) test //...
+build:
+	go build ./...
 
-gazelle-repos:
-	dep ensure
-	$(BAZEL) run //:gazelle -- update-repos -from_file=Gopkg.lock
+test: build
+	go test ./...
 
-gazelle: gazelle-repos
-	$(BAZEL) run //:gazelle
-
-test: $(BAZEL) test //...
+# Test with color output.
+# go get -u github.com/rakyll/gotest
+testc: build
+	gotest -v ./... -bench=.
