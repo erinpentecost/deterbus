@@ -30,8 +30,16 @@ const (
 	EventTopic
 )
 
+var (
+	// ErrTopicShapeMismatch occurs when the arguments of a subsequent
+	// subcribe or publish to a topic don't match the arguments of the
+	// first subscribe to that topic.
+	ErrTopicShapeMismatch = fmt.Errorf("topic shape mismatch")
+)
+
 // Bus is a deterministic* event bus.
 type Bus struct {
+	options         busOptions
 	publishedNumber uint64
 	consumedNumber  uint64
 	pendingEvents   *queue.Queue
@@ -40,11 +48,17 @@ type Bus struct {
 	done            chan interface{}
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
+
+	// shapeMap holds a map of topic -> args list.
+	// This gets set the first time we see any publish or subscribe
+	// for this topic. Once set, it can't be changed.
+	shapeMap *sync.Map
 }
 
 // New creates a new Bus.
-func New() *Bus {
+func New(opts ...BusOption) *Bus {
 	eb := Bus{
+		options:         buildOptions(opts...),
 		publishedNumber: 0,
 		consumedNumber:  0,
 		pendingEvents:   queue.New(),
@@ -53,6 +67,8 @@ func New() *Bus {
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
 		eventWatcher:    sync.NewCond(&sync.Mutex{}),
+
+		shapeMap: &sync.Map{},
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
@@ -178,6 +194,17 @@ func init() {
 
 func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
+
+	// check shapeMap
+	argTypes := make([]reflect.Type, len(args))
+	for i := range argTypes {
+		argTypes[i] = reflect.TypeOf(args[i])
+	}
+	if err := eb.validatePublishShape(topic, argTypes); err != nil {
+		done := make(chan interface{})
+		defer close(done)
+		return done, err
+	}
 
 	// I need to claim the publish number before adding to queue
 	eb.eventWatcher.L.Lock()
@@ -335,7 +362,7 @@ func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{},
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
-// Once indicates that the handler should unsubcribe after
+// Once indicates that the handler should unsubscribe after
 // receiving its first call.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
@@ -351,6 +378,18 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 		callerMsg = fmt.Sprintf("%s [%v]", callerFile, callerLine)
 	}
 
+	// check shapeMap
+	fnType := reflect.TypeOf(fn)
+	argTypes := make([]reflect.Type, fnType.NumIn())
+	for i := range argTypes {
+		argTypes[i] = fnType.In(i)
+	}
+	if err := eb.validateSubscribeShape(topic, argTypes); err != nil {
+		done := make(chan interface{})
+		defer close(done)
+		return done, err
+	}
+
 	evh, err := newHandler(topic, once, callerMsg, fn)
 	if err != nil {
 		done := make(chan interface{})
@@ -364,19 +403,122 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 	// Topic doesn't exist yet, so create it.
 	if (!ok) || currentListeners == nil {
 		eb.listeners[evh.topic] = make([]*eventHandler, 0)
-	} else if len(currentListeners) > 0 {
-		// make sure the function type is the same as other listeners
-		if currentListeners[0].shape != evh.shape {
-			done := make(chan interface{})
-			defer close(done)
-			eb.queueLocker.Unlock()
-			return done, fmt.Errorf("new subscriber for %s has a different function definition", evh.topic)
-		}
-
 	}
 	eb.queueLocker.Unlock()
 
 	return eb.Publish(subscribeEvent, eb, evh)
+}
+
+func (eb *Bus) validatePublishShape(topic interface{}, argTypes []reflect.Type) error {
+	if !eb.options.validate {
+		return nil
+	}
+
+	uncastTypes, ok := eb.shapeMap.Load(topic)
+	if !ok {
+		return nil
+	}
+	existingTypes, ok := uncastTypes.([]reflect.Type)
+	if !ok {
+		panic("expected to get []reflect.Type from eb.shapeMap")
+	}
+
+	if len(existingTypes) != len(argTypes) {
+		return fmt.Errorf(
+			"topic %s: %w: expected %d arguments, found %d arguments",
+			topic,
+			ErrTopicShapeMismatch,
+			len(existingTypes),
+			len(argTypes))
+	}
+
+	for i := range argTypes {
+		if argTypes[i] == nil {
+			// This will miss a bunch of errors
+			switch existingTypes[i].Kind() {
+			case reflect.Array:
+				fallthrough
+			case reflect.Chan:
+				fallthrough
+			case reflect.Map:
+				fallthrough
+			case reflect.Pointer:
+				fallthrough
+			case reflect.Slice:
+				fallthrough
+			case reflect.Interface:
+				break
+			default:
+				return fmt.Errorf(
+					"topic: %s: %w: argument at index %d: found nil, expected %s",
+					topic,
+					ErrTopicShapeMismatch,
+					i,
+					existingTypes[i].Kind())
+			}
+		} else if existingTypes[i].Kind() == reflect.Interface {
+			if !argTypes[i].Implements(existingTypes[i]) {
+				return fmt.Errorf(
+					"topic: %s: %w: argument at index %d: %s doesn't implement %s",
+					topic,
+					ErrTopicShapeMismatch,
+					i,
+					argTypes[i].Kind(),
+					existingTypes[i].Kind())
+			}
+		} else {
+			if !argTypes[i].AssignableTo(existingTypes[i]) {
+				return fmt.Errorf(
+					"topic: %s: %w: argument at index %d: %s is not assignable to %s",
+					topic,
+					ErrTopicShapeMismatch,
+					i,
+					argTypes[i].Kind(),
+					existingTypes[i].Kind())
+			}
+		}
+	}
+	return nil
+}
+
+func (eb *Bus) validateSubscribeShape(topic interface{}, argTypes []reflect.Type) error {
+	if !eb.options.validate {
+		return nil
+	}
+
+	// get or set val from shape map
+	uncastTypes, loaded := eb.shapeMap.LoadOrStore(topic, argTypes)
+	if !loaded {
+		return nil
+	}
+	existingTypes, ok := uncastTypes.([]reflect.Type)
+	if !ok {
+		panic("expected to get []reflect.Type from eb.shapeMap")
+	}
+
+	if len(existingTypes) != len(argTypes) {
+		return fmt.Errorf(
+			"topic %s: %w: expected %d arguments, found %d arguments",
+			topic,
+			ErrTopicShapeMismatch,
+			len(existingTypes),
+			len(argTypes))
+	}
+
+	// check for strict equality if this another subscribe
+	for i := range argTypes {
+		if existingTypes[i] != argTypes[i] {
+			return fmt.Errorf(
+				"topic: %s: %w: argument at index %d: expected %s, found %s",
+				topic,
+				ErrTopicShapeMismatch,
+				i,
+				existingTypes[i].Kind(),
+				argTypes[i].Kind())
+		}
+	}
+
+	return nil
 }
 
 // This is the subscribe handler.

@@ -11,7 +11,6 @@ type eventHandler struct {
 	topic      interface{}
 	callBack   reflect.Value
 	flagOnce   bool
-	shape      reflect.Type
 	subscriber string
 }
 
@@ -51,7 +50,6 @@ func newHandler(topic interface{}, once bool, trace string, fn interface{}) (eve
 		topic:      topic,
 		callBack:   reflect.ValueOf(fn),
 		flagOnce:   once,
-		shape:      reflect.TypeOf(fn),
 		subscriber: trace,
 	}, nil
 }
