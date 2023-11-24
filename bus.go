@@ -149,8 +149,6 @@ func (eb *Bus) Wait() <-chan interface{} {
 }
 
 // Publish adds an event to the queue.
-// ctx is passed in as the first argument to the handler,
-// followed by args.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) Publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
@@ -159,8 +157,6 @@ func (eb *Bus) Publish(topic interface{}, args ...interface{}) (<-chan interface
 
 // PublishSync adds an event to the queue.
 // Listeners will process the event serially and deterministically.
-// ctx is passed in as the first argument to the handler,
-// followed by args.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
 func (eb *Bus) PublishSync(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
@@ -177,7 +173,7 @@ func publishDraining(eb *Bus, topic interface{}, txn bool, args ...interface{}) 
 var ctxType reflect.Type
 
 func init() {
-	ctxType = reflect.TypeOf(context.TODO())
+	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 }
 
 func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
@@ -190,7 +186,7 @@ func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<
 	eb.eventWatcher.L.Unlock()
 
 	//  Add on context values if first arg is a context.
-	if (len(args) > 0) && (reflect.TypeOf(args[0]) == ctxType) {
+	if (len(args) > 0) && (reflect.TypeOf(args[0]).Implements(ctxType)) {
 		args[0] = context.WithValue(
 			context.WithValue(
 				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, topic), EventNumber, pubNum)

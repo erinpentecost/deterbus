@@ -8,6 +8,7 @@
 deterbus is a deterministic event bus for Go. Things that make this different from other event bus implementations:
 
 * There is a single event queue for all topics. Events are processed one-at-a-time.
+* All subscribers receive all events sent to the topic they listen to.
 * Subscription and Unsubscription are events under the hood!
 * An event doesn't finish processing until after all subscribed handlers have returned.
 * Subscribers are invoked concurrently or serially for the same event, depending on how you publish it. The former method isn't deterministic.
@@ -22,4 +23,4 @@ Special considerations:
 
 * This library depends on pointers to handle callbacks instead of an entity/id system. That means serialization is a real pain.
 * The event bus will keep callbacks from being garbage collected.
-* Publication of one event to one subsriber isn't fast. On my system, it takes 0.184731 ms.
+* Publication of one event to one subscriber isn't fast. On my system, it takes 0.184731 ms.
