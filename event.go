@@ -12,7 +12,7 @@ var handlerID = atomic.Uint64{}
 type eventHandler struct {
 	// id is used for unsubscription.
 	id         uint64
-	topic      interface{}
+	topic      *topicIdentifier
 	callBack   reflect.Value
 	flagOnce   bool
 	subscriber string
@@ -20,7 +20,7 @@ type eventHandler struct {
 
 // argEvent is the args passed into eventHandler.
 type argEvent struct {
-	topic         interface{}
+	topic         *topicIdentifier
 	args          []interface{}
 	eventNumber   uint64
 	finished      chan interface{}
@@ -42,7 +42,7 @@ func (evh *eventHandler) call(params []reflect.Value) {
 	evh.callBack.Call(params)
 }
 
-func newHandler(topic interface{}, once bool, trace string, fn interface{}) eventHandler {
+func newHandler(topic *topicIdentifier, once bool, trace string, fn interface{}) eventHandler {
 	// Wrap it up.
 	return eventHandler{
 		id:         handlerID.Add(1),

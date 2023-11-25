@@ -12,13 +12,10 @@ func TestExample(t *testing.T) {
 	b := deterbus.New() // Create a new Bus.
 	defer b.Stop()      // Make sure we don't leave any orphaned events when we leave scope.
 
-	// Create a new topic definition for tracking changes to our bank account
+	// Create a new topic for tracking changes to our bank account
 	// so we can maintain a balance. We specify the type of the argument
 	// we are going to send along with the event with the help of generics.
-	var bankAccountValueChangeTopicDefinition = deterbus.TopicDefinition[int]{}
-	// Attach the topic defintion to the Bus, giving us a Topic we can publish
-	// and subscribe to.
-	bankAccountValueChangeTopic := bankAccountValueChangeTopicDefinition.RegisterOn(b)
+	bankAccountValueChangeTopic := deterbus.NewTopic(b, deterbus.TopicDefinition[int]{})
 
 	// Create our handler.
 	balance := 0

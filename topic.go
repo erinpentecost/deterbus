@@ -6,21 +6,50 @@ import (
 	"sync/atomic"
 )
 
-// Dynamic topic ID generator that won't conflict with anything else.
-type genericTopicIDType uint64
+// TopicIDType uniquely identifies a topic.
+type TopicIDType uint64
 
 var genericTopicID atomic.Uint64
 
 // TopicDefinition is a definition for a topic.
 // It exists to hold the type T.
-type TopicDefinition[T any] struct{}
+type TopicDefinition[T any] struct {
+	// Name can be set to provide a user-readable name.
+	// This might appear in logs.
+	Name string
+}
+
+// topicIdentifier is a container for the ID and a Name of a topic.
+type topicIdentifier struct {
+	id   TopicIDType
+	name string
+}
+
+type TopicIdentifier interface {
+	ID() TopicIDType
+	Name() string
+}
+
+func (ti *topicIdentifier) ID() TopicIDType {
+	return ti.id
+}
+
+func (ti *topicIdentifier) Name() string {
+	return ti.name
+}
+
+var _ TopicIdentifier = (*topicIdentifier)(nil)
 
 // RegisterOn registers a TopicDefinition onto a Bus to get a Topic.
+// You probably just want to use NewTopic().
 func (d *TopicDefinition[T]) RegisterOn(bus *Bus) *Topic[T] {
 	return &Topic[T]{
 		Bus:             bus,
 		TopicDefinition: *d,
-		ID:              genericTopicIDType(genericTopicID.Add(1)),
+		id: &topicIdentifier{
+			id:   TopicIDType(genericTopicID.Add(1)),
+			name: d.Name,
+		},
 	}
 }
 
@@ -36,14 +65,19 @@ type Topic[T any] struct {
 	Bus             *Bus
 	TopicDefinition TopicDefinition[T]
 	TopicType       reflect.Type
-	ID              genericTopicIDType
+	id              *topicIdentifier
+}
+
+// NewTopic registers a TopicDefinition onto a Bus to get a Topic.
+func NewTopic[T any](bus *Bus, d TopicDefinition[T]) *Topic[T] {
+	return d.RegisterOn(bus)
 }
 
 // Publish arg to this topic. Handlers will be called concurrently and non-deterministically.
 // This will only return an error if the bus is draining.
 func (t *Topic[T]) Publish(ctx context.Context, arg T) (<-chan interface{}, error) {
 	return t.Bus.publish(
-		t.ID,
+		t.id,
 		ctx,
 		arg,
 	)
@@ -53,7 +87,7 @@ func (t *Topic[T]) Publish(ctx context.Context, arg T) (<-chan interface{}, erro
 // This will only return an error if the bus is draining.
 func (t *Topic[T]) PublishSerially(ctx context.Context, arg T) (<-chan interface{}, error) {
 	return t.Bus.publishSerially(
-		t.ID,
+		t.id,
 		ctx,
 		arg,
 	)
@@ -62,7 +96,7 @@ func (t *Topic[T]) PublishSerially(ctx context.Context, arg T) (<-chan interface
 // Subscribe a handler to this topic.
 func (t *Topic[T]) Subscribe(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
 	return t.Bus.subscribe(
-		t.ID,
+		t.id,
 		fn,
 	)
 }
@@ -70,7 +104,7 @@ func (t *Topic[T]) Subscribe(fn func(ctx context.Context, arg T)) (<-chan interf
 // SubscribeOnce a handler to this topic. Once it receives an event, it will be unsubscribed.
 func (t *Topic[T]) SubscribeOnce(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
 	return t.Bus.subscribeOnce(
-		t.ID,
+		t.id,
 		fn,
 	)
 }

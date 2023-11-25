@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConstructor(t *testing.T) {
@@ -21,13 +21,6 @@ func TestEmptyDrain(t *testing.T) {
 	b := New()
 	<-b.DrainStop()
 }
-
-type dummyTopicType int
-
-const (
-	dummyTopicA dummyTopicType = iota
-	dummyTopicB
-)
 
 func TestFnType(t *testing.T) {
 	sampleFn := func() bool {
@@ -44,64 +37,82 @@ func TestSubscribe(t *testing.T) {
 
 	receiveCount := 0
 
-	handler := func() {
+	handler := func(_ context.Context, _ int) {
 		receiveCount++
 	}
 
-	done, _ := b.subscribe(dummyTopicA, handler)
+	dummyTopicA := NewTopic(b, TopicDefinition[int]{})
+
+	done, _ := dummyTopicA.Subscribe(handler)
 	<-done
 }
 
-func send(t *testing.T, b *Bus, syncTxn bool, topic int, count int) interface{} {
+func send(t testing.TB, b *Bus, syncTxn bool, handlerCount int, messageCount int) {
 
+	// make a shared handler that just records whatever
+	// int is sent to it in a slice.
 	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
-
-	handler := func(id int) {
+	handler := func(_ context.Context, id int) {
 		pubsLocker.Lock()
 		pubsSeen = append(pubsSeen, id)
 		pubsLocker.Unlock()
 	}
 
-	s, _ := b.subscribe(topic, handler)
+	// make one topic
+	topic := NewTopic(b, TopicDefinition[int]{})
 
-	<-s
+	// register the handler multiple times on the topic.
+	// we should get handlerCount copies of each message
+	// in pubsSeen
+	for i := 0; i < handlerCount; i++ {
+		s, _ := topic.Subscribe(handler)
+		<-s
+	}
 
+	// send a bunch of messages in any order
+	ctx := context.TODO()
 	var wg sync.WaitGroup
-	wg.Add(count)
-	for i := 0; i < count; i++ {
+	wg.Add(messageCount)
+	for i := 0; i < messageCount; i++ {
 		go func(id int) {
 			defer wg.Done()
 			if syncTxn {
-				p, er := b.publishSerially(topic, id)
-				assert.Equal(t, nil, er)
+				p, err := topic.PublishSerially(ctx, id)
+				require.NoError(t, err)
 				<-p
 			} else {
-				p, er := b.publish(topic, id)
-				assert.Equal(t, nil, er)
+				p, err := topic.Publish(ctx, id)
+				require.NoError(t, err)
 				<-p
 			}
 		}(i)
 	}
+	wg.Wait() // wait until all sent
 
-	wg.Wait()
-
-	assert.Equal(t, len(pubsSeen), count, "publishes missing")
+	require.Equal(t, handlerCount*messageCount, len(pubsSeen), "publishes missing")
 
 	slices.Sort(pubsSeen)
 
-	for i := 0; i < count; i++ {
-		assert.Equal(t, i, pubsSeen[i])
+	for h := 0; h < handlerCount; h++ {
+		for m := 0; m < messageCount; m++ {
+			require.Equal(t, m, pubsSeen[(h+1)*m])
+		}
 	}
-
-	return handler
 }
 
 func TestPublishSingleSubscriberAsync(t *testing.T) {
 	b := New()
 	defer b.Stop()
 
-	send(t, b, false, 0, 2000)
+	send(t, b, false, 1, 2000)
+}
+
+func TestPublishSingleSubscriberSync(t *testing.T) {
+	b := New()
+	defer b.Stop()
+
+	send(t, b, true, 1, 2000)
 }
 
 func TestPublishManySubscribersAsync(t *testing.T) {
@@ -113,20 +124,13 @@ func TestPublishManySubscribersAsync(t *testing.T) {
 	wg.Add(topicCount)
 
 	for i := 0; i < topicCount; i++ {
-		go func(topic int) {
+		go func(topic uint64) {
 			defer wg.Done()
-			send(t, b, false, topic, 100)
-		}(i)
+			send(t, b, false, 1, 100)
+		}(uint64(i))
 	}
 
 	wg.Wait()
-}
-
-func TestPublishSingleSubscriberSync(t *testing.T) {
-	b := New()
-	defer b.Stop()
-
-	send(t, b, true, 0, 2000)
 }
 
 func TestPublishManySubscribersSync(t *testing.T) {
@@ -140,7 +144,7 @@ func TestPublishManySubscribersSync(t *testing.T) {
 	for i := 0; i < topicCount; i++ {
 		go func(topic int) {
 			defer wg.Done()
-			send(t, b, true, topic, 100)
+			send(t, b, true, 1, 100)
 		}(i)
 	}
 
@@ -151,24 +155,25 @@ func TestContextPublish(t *testing.T) {
 	bus := New()
 	defer bus.Stop()
 
-	foundTopic := int(-1)
+	var foundTopic TopicIdentifier
 	foundNum := uint64(4444)
 
-	expectedTopic := int(999)
+	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
 
-	handler := func(ctx context.Context) {
-		foundTopic = ctx.Value(EventTopic).(int)
+	expectedTopic := dummyTopicA.id.id
+
+	handler := func(ctx context.Context, _ int) {
+		foundTopic = ctx.Value(EventTopic).(TopicIdentifier)
 		foundNum = ctx.Value(EventNumber).(uint64)
 	}
 
-	s, _ := bus.subscribe(expectedTopic, handler)
-
+	s, _ := dummyTopicA.Subscribe(handler)
 	<-s
 
-	p, _ := bus.publish(expectedTopic, context.Background())
+	p, _ := dummyTopicA.Publish(context.Background(), 4)
 	<-p
 
-	assert.Equal(t, expectedTopic, foundTopic)
+	assert.Equal(t, expectedTopic, foundTopic.ID())
 	// we should be on the second publish, because
 	// a subscribe is internally treated as a publish
 	assert.Equal(t, uint64(2), foundNum)
@@ -183,8 +188,8 @@ func TestWait(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	someTopic := int(999)
-	s, _ := bus.subscribe(someTopic, func() { wg.Wait() })
+	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
+	s, _ := dummyTopicA.Subscribe(func(_ context.Context, _ int) { wg.Wait() })
 	<-s
 
 	// set up new goroutine that will wait until wg is Done,
@@ -197,7 +202,7 @@ func TestWait(t *testing.T) {
 		<-bus.Wait()
 	}()
 
-	p, _ := bus.publish(someTopic)
+	p, _ := dummyTopicA.Publish(context.TODO(), 0)
 
 	// at this point, the handler is "running" trying to finish the event
 
@@ -222,51 +227,19 @@ func (d DummyStruct) Ok() bool {
 	return d.bool
 }
 
-func TestPanicPublish(t *testing.T) {
-	bus := New()
-
-	expectedTopic := int(999)
-	expectedPanicContent := "Oh no, I broke!"
-	panicker := func() {
-		panic(expectedPanicContent)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var sp SubscriberPanic
-
-	intercepter := func(s SubscriberPanic) {
-		sp = s
-		wg.Done()
-	}
-
-	s, _ := bus.subscribe(expectedTopic, panicker)
-	p, _ := bus.SubscribeToPanic(intercepter)
-
-	<-s
-	<-p
-
-	pub, _ := bus.publish(expectedTopic)
-	<-pub
-
-	wg.Wait()
-	bus.DrainStop()
-
-	assert.NotEqual(t, nil, sp)
-	assert.Equal(t, expectedTopic, sp.Topic())
-	assert.Equal(t, expectedPanicContent, sp.Panic().(string))
-
-	assert.True(t, strings.Contains(sp.Error(), "subscriber for topic "))
-	assert.True(t, strings.Contains(sp.Subscriber(), "bus_test"))
-}
-
 func TestPublishWithNoSubscriber(t *testing.T) {
 	bus := New()
 	defer bus.DrainStop()
 
 	// This should complete and not time out.
-	p, _ := bus.publish(9999, 3423)
+	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
+	p, _ := dummyTopicA.Publish(context.Background(), 99999)
 	<-p
+}
+
+type multiSubmessage struct {
+	locker *sync.Mutex
+	resmap *map[int]int
 }
 
 func TestPublishMultipleSubscribers(t *testing.T) {
@@ -275,29 +248,24 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	subCount := 100
 	pubCount := 400
 
-	topic := 98
-
 	var resLock sync.Mutex
 	res := make(map[int]int)
 
-	pan, _ := bus.SubscribeToPanic(func(sp SubscriberPanic) {
-		assert.FailNow(t, "callback panic")
-	})
-	<-pan
+	dummyTopicA := NewTopic(bus, TopicDefinition[*multiSubmessage]{})
 
 	var wg sync.WaitGroup
 	wg.Add(subCount)
 	for i := 0; i < subCount; i++ {
 		go func(handlerid int) {
 			defer wg.Done()
-			s, _ := bus.subscribe(topic, func(locker *sync.Mutex, resmap *map[int]int) {
-				locker.Lock()
-				defer locker.Unlock()
-				v, ok := (*resmap)[handlerid]
+			s, _ := dummyTopicA.Subscribe(func(_ context.Context, msg *multiSubmessage) {
+				msg.locker.Lock()
+				defer msg.locker.Unlock()
+				v, ok := (*msg.resmap)[handlerid]
 				if ok {
-					(*resmap)[handlerid] = v + 1
+					(*msg.resmap)[handlerid] = v + 1
 				} else {
-					(*resmap)[handlerid] = 1
+					(*msg.resmap)[handlerid] = 1
 				}
 			})
 			<-s
@@ -307,7 +275,7 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	wg.Wait()
 
 	for p := 0; p < pubCount; p++ {
-		d, er := bus.publish(topic, &resLock, &res)
+		d, er := dummyTopicA.Publish(context.Background(), &multiSubmessage{locker: &resLock, resmap: &res})
 		assert.Nil(t, er, "publish failed")
 		<-d
 	}
@@ -320,29 +288,58 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	}
 }
 
-func simpleBenchmark(opts ...BusOption) func(b *testing.B) {
-	return func(b *testing.B) {
-		bus := New(opts...)
-		defer bus.Stop()
+// BenchmarkSinglePublish benchmarks one publish vs one subscriber.
+func BenchmarkSinglePublish(b *testing.B) {
+	bus := New()
+	defer bus.Stop()
 
-		handler := func() uint64 {
-			// no op
-			return 34
-		}
+	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
 
-		s, _ := bus.subscribe(0, handler)
+	handler := func(_ context.Context, _ int) {
+		// no op
+	}
 
-		<-s
+	s, _ := dummyTopicA.Subscribe(handler)
+	<-s
 
-		for n := 0; n < b.N; n++ {
-			p, _ := bus.publish(0)
-			<-p
-		}
-
+	for n := 0; n < b.N; n++ {
+		p, _ := dummyTopicA.Publish(context.TODO(), 0)
+		<-p
 	}
 }
 
-// BenchmarkSinglePublish benchmarks one publish vs one subscriber.
-func BenchmarkSinglePublish(b *testing.B) {
-	simpleBenchmark()(b)
+func BenchmarkLoad(b *testing.B) {
+	// 40 seconds
+	topicCount := 50
+	messagesPerTopic := 1000
+	handlersPerTopic := 1000
+
+	for n := 0; n < b.N; n++ {
+		bus := New()
+		defer bus.Stop()
+
+		var wg sync.WaitGroup
+		wg.Add(topicCount * messagesPerTopic * handlersPerTopic)
+
+		topics := []*Topic[int]{}
+		for i := 0; i < topicCount; i++ {
+			topic := NewTopic(bus, TopicDefinition[int]{})
+			topics = append(topics, topic)
+			for i := 0; i < handlersPerTopic; i++ {
+				s, _ := topic.Subscribe(func(_ context.Context, _ int) {
+					wg.Done()
+				})
+				<-s
+			}
+		}
+
+		for i := 0; i < topicCount; i++ {
+			topic := topics[i]
+			for i := 0; i < messagesPerTopic; i++ {
+				topic.Publish(context.TODO(), 0)
+			}
+		}
+
+		wg.Wait()
+	}
 }

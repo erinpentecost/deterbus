@@ -10,14 +10,6 @@ import (
 	"github.com/eapache/queue"
 )
 
-type metaEvent int
-
-const (
-	subscribeEvent metaEvent = iota
-	unsubscribeEvent
-	errorEvent
-)
-
 // CtxKey is used to prevent collisions on additions
 // to the context passed in to Subscribers.
 type CtxKey int
@@ -39,11 +31,15 @@ type Bus struct {
 	publishedNumber uint64
 	consumedNumber  uint64
 	pendingEvents   *queue.Queue
-	listeners       map[interface{}]([]*eventHandler)
-	publishMethod   func(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error)
+	listeners       map[TopicIDType]([]*eventHandler)
+	publishMethod   func(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error)
 	done            chan interface{}
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
+
+	subscribeTopic   *topicIdentifier
+	unsubscribeTopic *topicIdentifier
+	errorTopic       *topicIdentifier
 }
 
 // New creates a new Bus.
@@ -53,21 +49,34 @@ func New(opts ...BusOption) *Bus {
 		publishedNumber: 0,
 		consumedNumber:  0,
 		pendingEvents:   queue.New(),
-		listeners:       make(map[interface{}]([]*eventHandler)),
+		listeners:       make(map[TopicIDType]([]*eventHandler)),
 		publishMethod:   publishNormal,
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
 		eventWatcher:    sync.NewCond(&sync.Mutex{}),
+
+		subscribeTopic: &topicIdentifier{
+			id:   TopicIDType(genericTopicID.Add(1)),
+			name: "subscribe",
+		},
+		unsubscribeTopic: &topicIdentifier{
+			id:   TopicIDType(genericTopicID.Add(1)),
+			name: "unsubscribe",
+		},
+		errorTopic: &topicIdentifier{
+			id:   TopicIDType(genericTopicID.Add(1)),
+			name: "error",
+		},
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
 	// This helps make the whole thing more deterministic.
 	// But to get this to work, we need to bootstrap them in.
-	subHandler := newHandler(subscribeEvent, false, "contructor", subscribe)
-	unsubHandler := newHandler(unsubscribeEvent, false, "constructor", unsubscribe)
+	subHandler := newHandler(eb.subscribeTopic, false, "contructor", subscribe)
+	unsubHandler := newHandler(eb.unsubscribeTopic, false, "constructor", unsubscribe)
 
-	eb.listeners[subscribeEvent] = []*eventHandler{&subHandler}
-	eb.listeners[unsubscribeEvent] = []*eventHandler{&unsubHandler}
+	eb.listeners[eb.subscribeTopic.id] = []*eventHandler{&subHandler}
+	eb.listeners[eb.unsubscribeTopic.id] = []*eventHandler{&unsubHandler}
 
 	// Start consumer.
 	go func() {
@@ -148,7 +157,7 @@ func (eb *Bus) Wait() <-chan interface{} {
 // publish adds an event to the queue. Handlers will be called concurrently.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func (eb *Bus) publish(topic *topicIdentifier, args ...interface{}) (<-chan interface{}, error) {
 	return eb.publishMethod(eb, topic, false, args...)
 }
 
@@ -156,11 +165,11 @@ func (eb *Bus) publish(topic interface{}, args ...interface{}) (<-chan interface
 // Listeners will process the event serially and deterministically.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) publishSerially(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func (eb *Bus) publishSerially(topic *topicIdentifier, args ...interface{}) (<-chan interface{}, error) {
 	return eb.publishMethod(eb, topic, true, args...)
 }
 
-func publishDraining(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
+func publishDraining(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 	close(done)
 	return done, ErrDraining
@@ -173,7 +182,7 @@ func init() {
 	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 }
 
-func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
+func publishNormal(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 
 	// I need to claim the publish number before adding to queue
@@ -184,9 +193,10 @@ func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<
 
 	//  Add on context values if first arg is a context.
 	if (len(args) > 0) && (reflect.TypeOf(args[0]).Implements(ctxType)) {
+		var ti TopicIdentifier = topic
 		args[0] = context.WithValue(
 			context.WithValue(
-				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, topic), EventNumber, pubNum)
+				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, ti), EventNumber, pubNum)
 	}
 
 	ev := argEvent{
@@ -232,7 +242,7 @@ func processEvent(eb *Bus) <-chan interface{} {
 	defer close(ev.finished)
 
 	// Find the listeners for it
-	listeners, ok := eb.listeners[ev.topic]
+	listeners, ok := eb.listeners[ev.topic.ID()]
 
 	// If there are no listeners, just quit.
 	if !ok || len(listeners) == 0 {
@@ -257,29 +267,16 @@ func processEvent(eb *Bus) <-chan interface{} {
 	for i := len(listeners) - 1; i >= 0; i-- {
 		listener := listeners[i]
 		if listener == nil {
-			panic(fmt.Sprintf("%vth listener for %s is nil", i, ev.topic))
+			panic(fmt.Sprintf("%vth listener for %d is nil", i, ev.topic.ID()))
 		}
 
-		// Actually invoke the listener.
+		// Wrap handler callback.
 		invokeHndlr := func(l *eventHandler) {
 			defer lwg.Done()
-
-			// Catch panics, but not if this panic is from
-			// a panic handler itself.
-			defer func() {
-				if r := recover(); (r != nil) && (ev.topic != errorEvent) {
-					eb.publish(errorEvent, SubscriberPanic{
-						internal:      r,
-						topic:         ev.topic,
-						publishNumber: ev.eventNumber,
-						subscriber:    l.subscriber,
-					})
-				}
-			}()
-
 			l.call(params)
 		}
 
+		// Call callback.
 		if ev.transactional {
 			invokeHndlr(listener)
 		} else {
@@ -315,19 +312,13 @@ func processEvent(eb *Bus) <-chan interface{} {
 // Unsubscribe will unsubscribe a handler from a topic.
 type Unsubscribe func() <-chan interface{}
 
-// SubscribeToPanic lets you handle panics called by your callback
-// functions. This can be useful for logging.
-func (eb *Bus) SubscribeToPanic(fn func(SubscriberPanic)) (<-chan interface{}, Unsubscribe) {
-	return eb.subscribeImplementation(errorEvent, false, fn)
-}
-
 // subscribe adds a new handler for the given topic.
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribe(topic interface{}, fn interface{}) (<-chan interface{}, Unsubscribe) {
+func (eb *Bus) subscribe(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	return eb.subscribeImplementation(topic, false, fn)
 }
 
@@ -339,11 +330,11 @@ func (eb *Bus) subscribe(topic interface{}, fn interface{}) (<-chan interface{},
 // receiving its first call.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribeOnce(topic interface{}, fn interface{}) (<-chan interface{}, Unsubscribe) {
+func (eb *Bus) subscribeOnce(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	return eb.subscribeImplementation(topic, true, fn)
 }
 
-func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interface{}) (<-chan interface{}, Unsubscribe) {
+func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	// Store information on caller.
 	_, callerFile, callerLine, ok := runtime.Caller(2)
 	callerMsg := "unknown"
@@ -362,10 +353,10 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 
 	// Create the listener collection
 	eb.queueLocker.Lock()
-	currentListeners, ok := eb.listeners[evh.topic]
+	currentListeners, ok := eb.listeners[topic.id]
 	// Topic doesn't exist yet, so create it.
 	if (!ok) || currentListeners == nil {
-		eb.listeners[evh.topic] = make([]*eventHandler, 0)
+		eb.listeners[topic.id] = make([]*eventHandler, 0)
 	}
 	eb.queueLocker.Unlock()
 
@@ -374,7 +365,7 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 		return eb.unsubscribe(topic, id)
 	}
 
-	sub, _ := eb.publish(subscribeEvent, eb, evh)
+	sub, _ := eb.publish(eb.subscribeTopic, eb, evh)
 	// Publish only returns an error when draining.
 	// Drop the error during subscribe.
 	return sub, unsub
@@ -386,7 +377,7 @@ func subscribe(eb *Bus, evh eventHandler) {
 	defer eb.queueLocker.Unlock()
 
 	// Add it to the list.
-	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], &evh)
+	eb.listeners[evh.topic.id] = append(eb.listeners[evh.topic.id], &evh)
 }
 
 // unsubscribe removes a handler from the given topic.
@@ -395,19 +386,19 @@ func subscribe(eb *Bus, evh eventHandler) {
 // yet.
 // This function returns a channel indicating when the unsubscribe
 // has taken effect.
-func (eb *Bus) unsubscribe(topic interface{}, id uint64) <-chan interface{} {
-	done, _ := eb.publish(unsubscribeEvent, eb, topic, id)
+func (eb *Bus) unsubscribe(topic *topicIdentifier, id uint64) <-chan interface{} {
+	done, _ := eb.publish(eb.unsubscribeTopic, eb, topic, id)
 	// Publish only returns an error when draining.
 	// Drop the error during unsubscribe.
 	return done
 }
 
 // This is the unsubscribe handler.
-func unsubscribe(eb *Bus, topic interface{}, id uint64) {
+func unsubscribe(eb *Bus, topic *topicIdentifier, id uint64) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
-	v, ok := eb.listeners[topic]
+	v, ok := eb.listeners[topic.id]
 
 	if !ok {
 		return
@@ -427,10 +418,10 @@ func unsubscribe(eb *Bus, topic interface{}, id uint64) {
 	}
 
 	if len(v) == 1 {
-		eb.listeners[topic] = make([]*eventHandler, 0)
+		eb.listeners[topic.id] = make([]*eventHandler, 0)
 		return
 	}
 
 	// Remove it.
-	eb.listeners[topic] = append(v[:index], v[index+1:]...)
+	eb.listeners[topic.id] = append(v[:index], v[index+1:]...)
 }
