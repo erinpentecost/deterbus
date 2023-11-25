@@ -2,7 +2,6 @@ package deterbus
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -31,10 +30,7 @@ const (
 )
 
 var (
-	// ErrTopicShapeMismatch occurs when the arguments of a subsequent
-	// subcribe or publish to a topic don't match the arguments of the
-	// first subscribe to that topic.
-	ErrTopicShapeMismatch = fmt.Errorf("topic shape mismatch")
+	ErrDraining = fmt.Errorf("bus is draining; publish rejected")
 )
 
 // Bus is a deterministic* event bus.
@@ -48,11 +44,6 @@ type Bus struct {
 	done            chan interface{}
 	queueLocker     *sync.Mutex
 	eventWatcher    *sync.Cond
-
-	// shapeMap holds a map of topic -> args list.
-	// This gets set the first time we see any publish or subscribe
-	// for this topic. Once set, it can't be changed.
-	shapeMap *sync.Map
 }
 
 // New creates a new Bus.
@@ -67,23 +58,13 @@ func New(opts ...BusOption) *Bus {
 		done:            make(chan interface{}),
 		queueLocker:     &sync.Mutex{},
 		eventWatcher:    sync.NewCond(&sync.Mutex{}),
-
-		shapeMap: &sync.Map{},
 	}
 
 	// Subscribe and Unsubscribe are treated as events.
 	// This helps make the whole thing more deterministic.
 	// But to get this to work, we need to bootstrap them in.
-	subHandler, subErr := newHandler(subscribeEvent, false, "contructor", subscribe)
-	unsubHandler, unsubErr := newHandler(unsubscribeEvent, false, "constructor", unsubscribe)
-
-	// These really shouldn't cause any errors.
-	if subErr != nil {
-		panic(subErr)
-	}
-	if unsubErr != nil {
-		panic(unsubErr)
-	}
+	subHandler := newHandler(subscribeEvent, false, "contructor", subscribe)
+	unsubHandler := newHandler(unsubscribeEvent, false, "constructor", unsubscribe)
 
 	eb.listeners[subscribeEvent] = []*eventHandler{&subHandler}
 	eb.listeners[unsubscribeEvent] = []*eventHandler{&unsubHandler}
@@ -164,25 +145,25 @@ func (eb *Bus) Wait() <-chan interface{} {
 	return done
 }
 
-// Publish adds an event to the queue.
+// publish adds an event to the queue. Handlers will be called concurrently.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) Publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func (eb *Bus) publish(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	return eb.publishMethod(eb, topic, false, args...)
 }
 
-// PublishSync adds an event to the queue.
+// publishSerially adds an event to the queue.
 // Listeners will process the event serially and deterministically.
 // The returned channel indicates when the event
 // has been completely consumed by subscribers (if any).
-func (eb *Bus) PublishSync(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
+func (eb *Bus) publishSerially(topic interface{}, args ...interface{}) (<-chan interface{}, error) {
 	return eb.publishMethod(eb, topic, true, args...)
 }
 
 func publishDraining(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
 	close(done)
-	return done, errors.New("bus is draining")
+	return done, ErrDraining
 }
 
 // Store reflected type of context
@@ -194,17 +175,6 @@ func init() {
 
 func publishNormal(eb *Bus, topic interface{}, txn bool, args ...interface{}) (<-chan interface{}, error) {
 	done := make(chan interface{})
-
-	// check shapeMap
-	argTypes := make([]reflect.Type, len(args))
-	for i := range argTypes {
-		argTypes[i] = reflect.TypeOf(args[i])
-	}
-	if err := eb.validatePublishShape(topic, argTypes); err != nil {
-		done := make(chan interface{})
-		defer close(done)
-		return done, err
-	}
 
 	// I need to claim the publish number before adding to queue
 	eb.eventWatcher.L.Lock()
@@ -298,7 +268,7 @@ func processEvent(eb *Bus) <-chan interface{} {
 			// a panic handler itself.
 			defer func() {
 				if r := recover(); (r != nil) && (ev.topic != errorEvent) {
-					eb.Publish(errorEvent, SubscriberPanic{
+					eb.publish(errorEvent, SubscriberPanic{
 						internal:      r,
 						topic:         ev.topic,
 						publishNumber: ev.eventNumber,
@@ -342,23 +312,26 @@ func processEvent(eb *Bus) <-chan interface{} {
 	return done
 }
 
+// Unsubscribe will unsubscribe a handler from a topic.
+type Unsubscribe func() <-chan interface{}
+
 // SubscribeToPanic lets you handle panics called by your callback
 // functions. This can be useful for logging.
-func (eb *Bus) SubscribeToPanic(fn func(SubscriberPanic)) (<-chan interface{}, error) {
+func (eb *Bus) SubscribeToPanic(fn func(SubscriberPanic)) (<-chan interface{}, Unsubscribe) {
 	return eb.subscribeImplementation(errorEvent, false, fn)
 }
 
-// Subscribe adds a new handler for the given topic.
+// subscribe adds a new handler for the given topic.
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
+func (eb *Bus) subscribe(topic interface{}, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	return eb.subscribeImplementation(topic, false, fn)
 }
 
-// SubscribeOnce adds a new handler for the given topic.
+// subscribeOnce adds a new handler for the given topic.
 // Subcription is actually an event, so you don't need to
 // worry about receiving events that haven't started processing
 // yet.
@@ -366,11 +339,11 @@ func (eb *Bus) Subscribe(topic interface{}, fn interface{}) (<-chan interface{},
 // receiving its first call.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) SubscribeOnce(topic interface{}, fn interface{}) (<-chan interface{}, error) {
+func (eb *Bus) subscribeOnce(topic interface{}, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	return eb.subscribeImplementation(topic, true, fn)
 }
 
-func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interface{}) (<-chan interface{}, error) {
+func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interface{}) (<-chan interface{}, Unsubscribe) {
 	// Store information on caller.
 	_, callerFile, callerLine, ok := runtime.Caller(2)
 	callerMsg := "unknown"
@@ -384,18 +357,8 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 	for i := range argTypes {
 		argTypes[i] = fnType.In(i)
 	}
-	if err := eb.validateSubscribeShape(topic, argTypes); err != nil {
-		done := make(chan interface{})
-		defer close(done)
-		return done, err
-	}
 
-	evh, err := newHandler(topic, once, callerMsg, fn)
-	if err != nil {
-		done := make(chan interface{})
-		defer close(done)
-		return done, err
-	}
+	evh := newHandler(topic, once, callerMsg, fn)
 
 	// Create the listener collection
 	eb.queueLocker.Lock()
@@ -406,119 +369,15 @@ func (eb *Bus) subscribeImplementation(topic interface{}, once bool, fn interfac
 	}
 	eb.queueLocker.Unlock()
 
-	return eb.Publish(subscribeEvent, eb, evh)
-}
-
-func (eb *Bus) validatePublishShape(topic interface{}, argTypes []reflect.Type) error {
-	if !eb.options.validate {
-		return nil
+	id := evh.id
+	unsub := func() <-chan interface{} {
+		return eb.unsubscribe(topic, id)
 	}
 
-	uncastTypes, ok := eb.shapeMap.Load(topic)
-	if !ok {
-		return nil
-	}
-	existingTypes, ok := uncastTypes.([]reflect.Type)
-	if !ok {
-		panic("expected to get []reflect.Type from eb.shapeMap")
-	}
-
-	if len(existingTypes) != len(argTypes) {
-		return fmt.Errorf(
-			"topic %s: %w: expected %d arguments, found %d arguments",
-			topic,
-			ErrTopicShapeMismatch,
-			len(existingTypes),
-			len(argTypes))
-	}
-
-	for i := range argTypes {
-		if argTypes[i] == nil {
-			// This will miss a bunch of errors
-			switch existingTypes[i].Kind() {
-			case reflect.Array:
-				fallthrough
-			case reflect.Chan:
-				fallthrough
-			case reflect.Map:
-				fallthrough
-			case reflect.Pointer:
-				fallthrough
-			case reflect.Slice:
-				fallthrough
-			case reflect.Interface:
-				break
-			default:
-				return fmt.Errorf(
-					"topic: %s: %w: argument at index %d: found nil, expected %s",
-					topic,
-					ErrTopicShapeMismatch,
-					i,
-					existingTypes[i].Kind())
-			}
-		} else if existingTypes[i].Kind() == reflect.Interface {
-			if !argTypes[i].Implements(existingTypes[i]) {
-				return fmt.Errorf(
-					"topic: %s: %w: argument at index %d: %s doesn't implement %s",
-					topic,
-					ErrTopicShapeMismatch,
-					i,
-					argTypes[i].Kind(),
-					existingTypes[i].Kind())
-			}
-		} else {
-			if !argTypes[i].AssignableTo(existingTypes[i]) {
-				return fmt.Errorf(
-					"topic: %s: %w: argument at index %d: %s is not assignable to %s",
-					topic,
-					ErrTopicShapeMismatch,
-					i,
-					argTypes[i].Kind(),
-					existingTypes[i].Kind())
-			}
-		}
-	}
-	return nil
-}
-
-func (eb *Bus) validateSubscribeShape(topic interface{}, argTypes []reflect.Type) error {
-	if !eb.options.validate {
-		return nil
-	}
-
-	// get or set val from shape map
-	uncastTypes, loaded := eb.shapeMap.LoadOrStore(topic, argTypes)
-	if !loaded {
-		return nil
-	}
-	existingTypes, ok := uncastTypes.([]reflect.Type)
-	if !ok {
-		panic("expected to get []reflect.Type from eb.shapeMap")
-	}
-
-	if len(existingTypes) != len(argTypes) {
-		return fmt.Errorf(
-			"topic %s: %w: expected %d arguments, found %d arguments",
-			topic,
-			ErrTopicShapeMismatch,
-			len(existingTypes),
-			len(argTypes))
-	}
-
-	// check for strict equality if this another subscribe
-	for i := range argTypes {
-		if existingTypes[i] != argTypes[i] {
-			return fmt.Errorf(
-				"topic: %s: %w: argument at index %d: expected %s, found %s",
-				topic,
-				ErrTopicShapeMismatch,
-				i,
-				existingTypes[i].Kind(),
-				argTypes[i].Kind())
-		}
-	}
-
-	return nil
+	sub, _ := eb.publish(subscribeEvent, eb, evh)
+	// Publish only returns an error when draining.
+	// Drop the error during subscribe.
+	return sub, unsub
 }
 
 // This is the subscribe handler.
@@ -530,18 +389,21 @@ func subscribe(eb *Bus, evh eventHandler) {
 	eb.listeners[evh.topic] = append(eb.listeners[evh.topic], &evh)
 }
 
-// Unsubscribe removes a handler from the given topic.
+// unsubscribe removes a handler from the given topic.
 // Unsubscription is actually an event, so you don't need to
 // worry about missing events that haven't started processing
 // yet.
 // This function returns a channel indicating when the unsubscribe
 // has taken effect.
-func (eb *Bus) Unsubscribe(topic interface{}, fn interface{}) (<-chan interface{}, error) {
-	return eb.Publish(unsubscribeEvent, eb, topic, fn)
+func (eb *Bus) unsubscribe(topic interface{}, id uint64) <-chan interface{} {
+	done, _ := eb.publish(unsubscribeEvent, eb, topic, id)
+	// Publish only returns an error when draining.
+	// Drop the error during unsubscribe.
+	return done
 }
 
 // This is the unsubscribe handler.
-func unsubscribe(eb *Bus, topic interface{}, fn interface{}) {
+func unsubscribe(eb *Bus, topic interface{}, id uint64) {
 	eb.queueLocker.Lock()
 	defer eb.queueLocker.Unlock()
 
@@ -554,13 +416,13 @@ func unsubscribe(eb *Bus, topic interface{}, fn interface{}) {
 	// Find the index for the handler.
 	index := -1
 	for i, handler := range v {
-		if handler.callBack == fn {
+		if handler.id == id {
 			index = i
 			break
 		}
 	}
 
-	if index <= 0 {
+	if index < 0 {
 		return
 	}
 

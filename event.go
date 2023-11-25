@@ -1,13 +1,17 @@
 package deterbus
 
 import (
-	"fmt"
 	"reflect"
+	"sync/atomic"
 )
+
+var handlerID = atomic.Uint64{}
 
 // eventHandler is a container around a function and metadata for
 // that function.
 type eventHandler struct {
+	// id is used for unsubscription.
+	id         uint64
 	topic      interface{}
 	callBack   reflect.Value
 	flagOnce   bool
@@ -38,18 +42,13 @@ func (evh *eventHandler) call(params []reflect.Value) {
 	evh.callBack.Call(params)
 }
 
-func newHandler(topic interface{}, once bool, trace string, fn interface{}) (eventHandler, error) {
-
-	// Verify input.
-	if reflect.TypeOf(fn).Kind() != reflect.Func {
-		return eventHandler{}, fmt.Errorf("topic %s: %s is not of type reflect.Func", topic, reflect.TypeOf(fn).Kind())
-	}
-
+func newHandler(topic interface{}, once bool, trace string, fn interface{}) eventHandler {
 	// Wrap it up.
 	return eventHandler{
+		id:         handlerID.Add(1),
 		topic:      topic,
 		callBack:   reflect.ValueOf(fn),
 		flagOnce:   once,
 		subscriber: trace,
-	}, nil
+	}
 }

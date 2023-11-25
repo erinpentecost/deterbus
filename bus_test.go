@@ -1,4 +1,4 @@
-package deterbus_test
+package deterbus
 
 import (
 	"context"
@@ -9,18 +9,16 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/erinpentecost/deterbus"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestConstructor(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	b.Stop()
 }
 
 func TestEmptyDrain(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	<-b.DrainStop()
 }
 
@@ -41,7 +39,7 @@ func TestFnType(t *testing.T) {
 }
 
 func TestSubscribe(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	defer b.Stop()
 
 	receiveCount := 0
@@ -50,12 +48,11 @@ func TestSubscribe(t *testing.T) {
 		receiveCount++
 	}
 
-	done, err := b.Subscribe(dummyTopicA, handler)
+	done, _ := b.subscribe(dummyTopicA, handler)
 	<-done
-	assert.Equal(t, nil, err)
 }
 
-func send(t *testing.T, b *deterbus.Bus, syncTxn bool, topic int, count int) interface{} {
+func send(t *testing.T, b *Bus, syncTxn bool, topic int, count int) interface{} {
 
 	pubsLocker := &sync.Mutex{}
 	pubsSeen := make([]int, 0)
@@ -66,9 +63,7 @@ func send(t *testing.T, b *deterbus.Bus, syncTxn bool, topic int, count int) int
 		pubsLocker.Unlock()
 	}
 
-	s, er := b.Subscribe(topic, handler)
-
-	assert.Equal(t, nil, er)
+	s, _ := b.subscribe(topic, handler)
 
 	<-s
 
@@ -78,11 +73,11 @@ func send(t *testing.T, b *deterbus.Bus, syncTxn bool, topic int, count int) int
 		go func(id int) {
 			defer wg.Done()
 			if syncTxn {
-				p, er := b.PublishSync(topic, id)
+				p, er := b.publishSerially(topic, id)
 				assert.Equal(t, nil, er)
 				<-p
 			} else {
-				p, er := b.Publish(topic, id)
+				p, er := b.publish(topic, id)
 				assert.Equal(t, nil, er)
 				<-p
 			}
@@ -102,29 +97,15 @@ func send(t *testing.T, b *deterbus.Bus, syncTxn bool, topic int, count int) int
 	return handler
 }
 
-func TestUnsubscribeAsync(t *testing.T) {
-	b := deterbus.New()
-	defer b.Stop()
-
-	handler := send(t, b, false, 19, 20)
-
-	unsub, ok := b.Unsubscribe(19, handler)
-
-	<-unsub
-
-	assert.Nil(t, ok, "failure to unsubscribe")
-
-}
-
 func TestPublishSingleSubscriberAsync(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	defer b.Stop()
 
 	send(t, b, false, 0, 2000)
 }
 
 func TestPublishManySubscribersAsync(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	defer b.Stop()
 
 	topicCount := 2000
@@ -141,29 +122,15 @@ func TestPublishManySubscribersAsync(t *testing.T) {
 	wg.Wait()
 }
 
-func TestUnsubscribeSync(t *testing.T) {
-	b := deterbus.New()
-	defer b.Stop()
-
-	handler := send(t, b, true, 19, 20)
-
-	unsub, ok := b.Unsubscribe(19, handler)
-
-	<-unsub
-
-	assert.Nil(t, ok, "failure to unsubscribe")
-
-}
-
 func TestPublishSingleSubscriberSync(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	defer b.Stop()
 
 	send(t, b, true, 0, 2000)
 }
 
 func TestPublishManySubscribersSync(t *testing.T) {
-	b := deterbus.New()
+	b := New()
 	defer b.Stop()
 
 	topicCount := 2000
@@ -181,7 +148,7 @@ func TestPublishManySubscribersSync(t *testing.T) {
 }
 
 func TestContextPublish(t *testing.T) {
-	bus := deterbus.New()
+	bus := New()
 	defer bus.Stop()
 
 	foundTopic := int(-1)
@@ -190,17 +157,15 @@ func TestContextPublish(t *testing.T) {
 	expectedTopic := int(999)
 
 	handler := func(ctx context.Context) {
-		foundTopic = ctx.Value(deterbus.EventTopic).(int)
-		foundNum = ctx.Value(deterbus.EventNumber).(uint64)
+		foundTopic = ctx.Value(EventTopic).(int)
+		foundNum = ctx.Value(EventNumber).(uint64)
 	}
 
-	s, err := bus.Subscribe(expectedTopic, handler)
-	require.NoError(t, err)
+	s, _ := bus.subscribe(expectedTopic, handler)
 
 	<-s
 
-	p, err := bus.Publish(expectedTopic, context.Background())
-	require.NoError(t, err)
+	p, _ := bus.publish(expectedTopic, context.Background())
 	<-p
 
 	assert.Equal(t, expectedTopic, foundTopic)
@@ -210,7 +175,7 @@ func TestContextPublish(t *testing.T) {
 }
 
 func TestWait(t *testing.T) {
-	bus := deterbus.New()
+	bus := New()
 	defer bus.Stop()
 
 	<-bus.Wait() // check brand-new empty bus
@@ -219,7 +184,7 @@ func TestWait(t *testing.T) {
 	wg.Add(1)
 
 	someTopic := int(999)
-	s, _ := bus.Subscribe(someTopic, func() { wg.Wait() })
+	s, _ := bus.subscribe(someTopic, func() { wg.Wait() })
 	<-s
 
 	// set up new goroutine that will wait until wg is Done,
@@ -232,7 +197,7 @@ func TestWait(t *testing.T) {
 		<-bus.Wait()
 	}()
 
-	p, _ := bus.Publish(someTopic)
+	p, _ := bus.publish(someTopic)
 
 	// at this point, the handler is "running" trying to finish the event
 
@@ -257,63 +222,8 @@ func (d DummyStruct) Ok() bool {
 	return d.bool
 }
 
-func TestMismatchedShapes(t *testing.T) {
-	stringBoolMap := map[string]bool{}
-	stringBoolMap["hi"] = true
-
-	bus := deterbus.New()
-	defer bus.Stop()
-
-	someTopic := int(999)
-
-	p, err := bus.Publish(someTopic, 3838)
-	require.NoError(t, err)
-	<-p
-
-	s, err := bus.Subscribe(someTopic, func(_ bool, _ DummyInterface, _ []int, _ map[string]bool) {})
-	// this is not an error because we only lock in shape for a topic
-	// with a subscribe
-	require.NoError(t, err)
-	<-s
-
-	p, err = bus.Publish(someTopic, "uh oh")
-	require.Error(t, err)
-	require.ErrorIs(t, err, deterbus.ErrTopicShapeMismatch)
-	<-p
-
-	p, err = bus.Publish(someTopic, true, DummyStruct{true}, []int{3, 3}, map[int]int{})
-	require.Error(t, err)
-	require.ErrorIs(t, err, deterbus.ErrTopicShapeMismatch)
-	<-p
-
-	p, err = bus.Publish(someTopic, true, struct{}{}, []int{3, 3}, stringBoolMap)
-	require.Error(t, err)
-	require.ErrorIs(t, err, deterbus.ErrTopicShapeMismatch)
-	<-p
-
-	p, err = bus.Publish(someTopic, nil, DummyStruct{false}, []int{3, 3}, stringBoolMap)
-	require.Error(t, err)
-	require.ErrorIs(t, err, deterbus.ErrTopicShapeMismatch)
-	<-p
-
-	// test nil vals
-	p, err = bus.Publish(someTopic, false, nil, []int{3, 3}, stringBoolMap)
-	require.NoError(t, err)
-	<-p
-	p, err = bus.Publish(someTopic, false, DummyStruct{true}, nil, stringBoolMap)
-	require.NoError(t, err)
-	<-p
-	p, err = bus.Publish(someTopic, false, DummyStruct{true}, []int{3, 3}, nil)
-	require.NoError(t, err)
-	<-p
-
-	p, err = bus.Publish(someTopic, true, DummyStruct{false}, []int{3, 3}, stringBoolMap)
-	require.NoError(t, err)
-	<-p
-}
-
 func TestPanicPublish(t *testing.T) {
-	bus := deterbus.New()
+	bus := New()
 
 	expectedTopic := int(999)
 	expectedPanicContent := "Oh no, I broke!"
@@ -323,20 +233,20 @@ func TestPanicPublish(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var sp deterbus.SubscriberPanic
+	var sp SubscriberPanic
 
-	intercepter := func(s deterbus.SubscriberPanic) {
+	intercepter := func(s SubscriberPanic) {
 		sp = s
 		wg.Done()
 	}
 
-	s, _ := bus.Subscribe(expectedTopic, panicker)
+	s, _ := bus.subscribe(expectedTopic, panicker)
 	p, _ := bus.SubscribeToPanic(intercepter)
 
 	<-s
 	<-p
 
-	pub, _ := bus.Publish(expectedTopic)
+	pub, _ := bus.publish(expectedTopic)
 	<-pub
 
 	wg.Wait()
@@ -347,20 +257,20 @@ func TestPanicPublish(t *testing.T) {
 	assert.Equal(t, expectedPanicContent, sp.Panic().(string))
 
 	assert.True(t, strings.Contains(sp.Error(), "subscriber for topic "))
-	assert.True(t, strings.Contains(sp.Subscriber(), "deterbus_test"))
+	assert.True(t, strings.Contains(sp.Subscriber(), "bus_test"))
 }
 
 func TestPublishWithNoSubscriber(t *testing.T) {
-	bus := deterbus.New()
+	bus := New()
 	defer bus.DrainStop()
 
 	// This should complete and not time out.
-	p, _ := bus.Publish(9999, 3423)
+	p, _ := bus.publish(9999, 3423)
 	<-p
 }
 
 func TestPublishMultipleSubscribers(t *testing.T) {
-	bus := deterbus.New()
+	bus := New()
 
 	subCount := 100
 	pubCount := 400
@@ -370,7 +280,7 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	var resLock sync.Mutex
 	res := make(map[int]int)
 
-	pan, _ := bus.SubscribeToPanic(func(sp deterbus.SubscriberPanic) {
+	pan, _ := bus.SubscribeToPanic(func(sp SubscriberPanic) {
 		assert.FailNow(t, "callback panic")
 	})
 	<-pan
@@ -380,7 +290,7 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	for i := 0; i < subCount; i++ {
 		go func(handlerid int) {
 			defer wg.Done()
-			s, er := bus.Subscribe(topic, func(locker *sync.Mutex, resmap *map[int]int) {
+			s, _ := bus.subscribe(topic, func(locker *sync.Mutex, resmap *map[int]int) {
 				locker.Lock()
 				defer locker.Unlock()
 				v, ok := (*resmap)[handlerid]
@@ -390,7 +300,6 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 					(*resmap)[handlerid] = 1
 				}
 			})
-			assert.Nil(t, er, "subscribe failed")
 			<-s
 		}(i)
 	}
@@ -398,7 +307,7 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	wg.Wait()
 
 	for p := 0; p < pubCount; p++ {
-		d, er := bus.Publish(topic, &resLock, &res)
+		d, er := bus.publish(topic, &resLock, &res)
 		assert.Nil(t, er, "publish failed")
 		<-d
 	}
@@ -411,9 +320,9 @@ func TestPublishMultipleSubscribers(t *testing.T) {
 	}
 }
 
-func simpleBenchmark(opts ...deterbus.BusOption) func(b *testing.B) {
+func simpleBenchmark(opts ...BusOption) func(b *testing.B) {
 	return func(b *testing.B) {
-		bus := deterbus.New(opts...)
+		bus := New(opts...)
 		defer bus.Stop()
 
 		handler := func() uint64 {
@@ -421,12 +330,12 @@ func simpleBenchmark(opts ...deterbus.BusOption) func(b *testing.B) {
 			return 34
 		}
 
-		s, _ := bus.Subscribe(0, handler)
+		s, _ := bus.subscribe(0, handler)
 
 		<-s
 
 		for n := 0; n < b.N; n++ {
-			p, _ := bus.Publish(0)
+			p, _ := bus.publish(0)
 			<-p
 		}
 
@@ -436,9 +345,4 @@ func simpleBenchmark(opts ...deterbus.BusOption) func(b *testing.B) {
 // BenchmarkSinglePublish benchmarks one publish vs one subscriber.
 func BenchmarkSinglePublish(b *testing.B) {
 	simpleBenchmark()(b)
-}
-
-// BenchmarkSinglePublish benchmarks one publish vs one subscriber.
-func BenchmarkSinglePublishNoValidation(b *testing.B) {
-	simpleBenchmark(deterbus.DontValidate)(b)
 }
