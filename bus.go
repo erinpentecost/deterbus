@@ -72,8 +72,8 @@ func New(opts ...BusOption) *Bus {
 	// Subscribe and Unsubscribe are treated as events.
 	// This helps make the whole thing more deterministic.
 	// But to get this to work, we need to bootstrap them in.
-	subHandler := newHandler(eb.subscribeTopic, false, "contructor", subscribe)
-	unsubHandler := newHandler(eb.unsubscribeTopic, false, "constructor", unsubscribe)
+	subHandler := newHandler(eb.subscribeTopic, false, "contructor", eb.createSubscribeHandler(), reflect.TypeOf(&eventHandler{}))
+	unsubHandler := newHandler(eb.unsubscribeTopic, false, "constructor", eb.createUnsubscribeCallback(), reflect.TypeOf(&unsubscribeMessage{}))
 
 	eb.listeners[eb.subscribeTopic.id] = []*eventHandler{&subHandler}
 	eb.listeners[eb.unsubscribeTopic.id] = []*eventHandler{&unsubHandler}
@@ -182,7 +182,7 @@ func init() {
 	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 }
 
-func publishNormal(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error) {
+func publishNormal[T any](eb *Bus, topic *topicIdentifier, txn bool, ctxArg context.Context, arg T) (<-chan interface{}, error) {
 	done := make(chan interface{})
 
 	// I need to claim the publish number before adding to queue
@@ -191,17 +191,14 @@ func publishNormal(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{
 	eb.publishedNumber = pubNum
 	eb.eventWatcher.L.Unlock()
 
-	//  Add on context values if first arg is a context.
-	if (len(args) > 0) && (reflect.TypeOf(args[0]).Implements(ctxType)) {
-		var ti TopicIdentifier = topic
-		args[0] = context.WithValue(
-			context.WithValue(
-				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, ti), EventNumber, pubNum)
-	}
+	//  Add on context values.
+	var ti TopicIdentifier = topic
+	ctxArg = context.WithValue(context.WithValue(ctxArg, EventNumber, pubNum), EventTopic, ti)
 
-	ev := argEvent{
+	ev := argEvent[T]{
 		topic:         topic,
-		args:          args,
+		ctxArg:        ctxArg,
+		arg:           arg,
 		eventNumber:   pubNum,
 		finished:      done,
 		transactional: txn,
@@ -238,11 +235,18 @@ func processEvent(eb *Bus) <-chan interface{} {
 	}
 
 	// Pop off the first event.
-	ev := eb.pendingEvents.Remove().(argEvent)
+	evRaw := eb.pendingEvents.Remove()
 	defer close(ev.finished)
 
-	// Find the listeners for it
-	listeners, ok := eb.listeners[ev.topic.ID()]
+	// get type of event
+	field, ok := reflect.TypeOf(evRaw).FieldByName("arg")
+	if !ok {
+		panic(fmt.Sprintf("no arg field in %v %T", evRaw, evRaw))
+	}
+	field.Type.
+
+		// Find the listeners for it
+		listeners, ok := eb.listeners[ev.topic.ID()]
 
 	// If there are no listeners, just quit.
 	if !ok || len(listeners) == 0 {
@@ -318,8 +322,8 @@ type Unsubscribe func() <-chan interface{}
 // yet.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribe(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
-	return eb.subscribeImplementation(topic, false, fn)
+func (eb *Bus) subscribe(topic *topicIdentifier, fn interface{}, argType reflect.Type) (<-chan interface{}, Unsubscribe) {
+	return eb.subscribeImplementation(topic, false, fn, argType)
 }
 
 // subscribeOnce adds a new handler for the given topic.
@@ -330,11 +334,11 @@ func (eb *Bus) subscribe(topic *topicIdentifier, fn interface{}) (<-chan interfa
 // receiving its first call.
 // This function returns a channel indicating when the subscribe has
 // taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribeOnce(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
-	return eb.subscribeImplementation(topic, true, fn)
+func (eb *Bus) subscribeOnce(topic *topicIdentifier, fn interface{}, argType reflect.Type) (<-chan interface{}, Unsubscribe) {
+	return eb.subscribeImplementation(topic, true, fn, argType)
 }
 
-func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn interface{}) (<-chan interface{}, Unsubscribe) {
+func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn interface{}, argType reflect.Type) (<-chan interface{}, Unsubscribe) {
 	// Store information on caller.
 	_, callerFile, callerLine, ok := runtime.Caller(2)
 	callerMsg := "unknown"
@@ -342,14 +346,7 @@ func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn int
 		callerMsg = fmt.Sprintf("%s [%v]", callerFile, callerLine)
 	}
 
-	// check shapeMap
-	fnType := reflect.TypeOf(fn)
-	argTypes := make([]reflect.Type, fnType.NumIn())
-	for i := range argTypes {
-		argTypes[i] = fnType.In(i)
-	}
-
-	evh := newHandler(topic, once, callerMsg, fn)
+	evh := newHandler(topic, once, callerMsg, fn, argType)
 
 	// Create the listener collection
 	eb.queueLocker.Lock()
@@ -371,13 +368,14 @@ func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn int
 	return sub, unsub
 }
 
-// This is the subscribe handler.
-func subscribe(eb *Bus, evh eventHandler) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
+func (eb *Bus) createSubscribeHandler() callbackType[*eventHandler] {
+	return func(ctx context.Context, evh *eventHandler) {
+		eb.queueLocker.Lock()
+		defer eb.queueLocker.Unlock()
 
-	// Add it to the list.
-	eb.listeners[evh.topic.id] = append(eb.listeners[evh.topic.id], &evh)
+		// Add it to the list.
+		eb.listeners[evh.topic.id] = append(eb.listeners[evh.topic.id], evh)
+	}
 }
 
 // unsubscribe removes a handler from the given topic.
@@ -393,35 +391,41 @@ func (eb *Bus) unsubscribe(topic *topicIdentifier, id uint64) <-chan interface{}
 	return done
 }
 
-// This is the unsubscribe handler.
-func unsubscribe(eb *Bus, topic *topicIdentifier, id uint64) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
+func (eb *Bus) createUnsubscribeCallback() callbackType[*unsubscribeMessage] {
+	return func(ctx context.Context, um *unsubscribeMessage) {
+		eb.queueLocker.Lock()
+		defer eb.queueLocker.Unlock()
 
-	v, ok := eb.listeners[topic.id]
+		v, ok := eb.listeners[um.topic.id]
 
-	if !ok {
-		return
-	}
-
-	// Find the index for the handler.
-	index := -1
-	for i, handler := range v {
-		if handler.id == id {
-			index = i
-			break
+		if !ok {
+			return
 		}
-	}
 
-	if index < 0 {
-		return
-	}
+		// Find the index for the handler.
+		index := -1
+		for i, handler := range v {
+			if handler.id == um.handlerID {
+				index = i
+				break
+			}
+		}
 
-	if len(v) == 1 {
-		eb.listeners[topic.id] = make([]*eventHandler, 0)
-		return
-	}
+		if index < 0 {
+			return
+		}
 
-	// Remove it.
-	eb.listeners[topic.id] = append(v[:index], v[index+1:]...)
+		if len(v) == 1 {
+			eb.listeners[um.topic.id] = make([]*eventHandler, 0)
+			return
+		}
+
+		// Remove it.
+		eb.listeners[um.topic.id] = append(v[:index], v[index+1:]...)
+	}
+}
+
+type unsubscribeMessage struct {
+	topic     *topicIdentifier
+	handlerID uint64
 }

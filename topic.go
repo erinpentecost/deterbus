@@ -95,16 +95,20 @@ func (t *Topic[T]) PublishSerially(ctx context.Context, arg T) (<-chan interface
 
 // Subscribe a handler to this topic.
 func (t *Topic[T]) Subscribe(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
+	var zeroArg [0]T
 	return t.Bus.subscribe(
 		t.id,
 		fn,
+		reflect.TypeOf(zeroArg),
 	)
 }
 
 // SubscribeOnce a handler to this topic. Once it receives an event, it will be unsubscribed.
 func (t *Topic[T]) SubscribeOnce(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
+	var zeroArg [0]T
 	return t.Bus.subscribeOnce(
 		t.id,
 		fn,
+		reflect.TypeOf(zeroArg),
 	)
 }
