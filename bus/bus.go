@@ -14,18 +14,14 @@ type runner interface {
 // Bus just controls when topic handlers are invoked.
 type Bus struct {
 	eventCond *sync.Cond
-	events    *queue.Queue
-
-	cancelled bool
-	cancel    context.CancelFunc
+	// events is a queue of runners
+	events *queue.Queue
 }
 
 func New(ctx context.Context) *Bus {
-	ctx, cancel := context.WithCancel(ctx)
 	b := &Bus{
 		eventCond: sync.NewCond(&sync.Mutex{}),
 		events:    queue.New(),
-		cancel:    cancel,
 	}
 
 	// use wg so we don't return the bus until
@@ -46,11 +42,14 @@ func New(ctx context.Context) *Bus {
 	return b
 }
 
-func (b *Bus) Stop() {
-	b.cancelled = true
-	b.cancel()
+func (b *Bus) publish(run runner) {
+	b.eventCond.L.Lock()
+	b.events.Add(run)
+	b.eventCond.Signal()
+	b.eventCond.L.Unlock()
 }
 
+// consume runs all the events on the queue
 func (b *Bus) consume(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Done()
 	for {
@@ -74,23 +73,15 @@ func (b *Bus) consume(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func NewTopic[T any](bus *Bus) *Topic[T] {
-	t := &Topic[T]{
-		bus:          bus,
-		callbackLock: &sync.Mutex{},
-		callbacks:    []*callbackContainer[T]{},
-	}
-	return t
-}
-
-type Callback[T any] func(context.Context, T)
-type Unsubscribe func()
-
 type callbackContainer[T any] struct {
-	handlerID uint64
-	fn        Callback[T]
+	// id is unique per callback per topic.
+	// this needs to exist to handle unsubscribe
+	id uint64
+	// fn is the actual callback function to invoke
+	fn Callback[T]
 }
 
+// event is a topic event.
 type event[T any] struct {
 	ctxArg context.Context
 	arg    T
@@ -112,80 +103,48 @@ func (e *event[T]) run() {
 	}
 }
 
-// Topic is what users interact with.
-// Each one watches the station to know when it must run.
-type Topic[T any] struct {
-	bus *Bus
-
-	// newer callbacks must go on the end
-	callbackLock   *sync.Mutex
-	callbacks      []*callbackContainer[T]
-	nextCallbackID uint64
+// subscribeEvent is an internal event that delays callback subscription
+type subscribeEvent[T any] struct {
+	topic    *Topic[T]
+	callback *callbackContainer[T]
 }
 
-// Waiter can be used to signal when all Subscribers have finished
-// processing an event.
-type Waiter interface {
-	Wait()
+func (s *subscribeEvent[T]) run() {
+	s.topic.callbackLock.Lock()
+	defer s.topic.callbackLock.Unlock()
+	s.topic.callbacks = append(s.topic.callbacks, s.callback)
 }
 
-func (t *Topic[T]) Publish(ctx context.Context, arg T) Waiter {
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	t.bus.eventCond.L.Lock()
-	ev := &event[T]{
-		ctxArg: ctx,
-		arg:    arg,
-		topic:  t,
-		wg:     &wg,
-	}
-	t.bus.events.Add(ev)
-	t.bus.eventCond.Signal()
-	t.bus.eventCond.L.Unlock()
-	return &wg
+// unsubscribeEvent is an internal event that delays callback removal
+type unsubscribeEvent[T any] struct {
+	topic      *Topic[T]
+	callbackID uint64
 }
 
-func (t *Topic[T]) Subscribe(callback Callback[T]) Unsubscribe {
-	// we hold callbackLock during event running
-	t.callbackLock.Lock()
-	defer t.callbackLock.Unlock()
-	// increment id
-	id := t.nextCallbackID
-	t.nextCallbackID += 1
+func (u *unsubscribeEvent[T]) run() {
+	u.topic.callbackLock.Lock()
+	defer u.topic.callbackLock.Unlock()
 
-	cc := &callbackContainer[T]{
-		handlerID: id,
-		fn:        callback,
+	// Find the index for the handler.
+	index := -1
+	for i, handler := range u.topic.callbacks {
+		if handler.id == u.callbackID {
+			index = i
+			break
+		}
 	}
 
-	t.callbacks = append(t.callbacks, cc)
-
-	// unsubscribe func
-	return func() {
-		t.callbackLock.Lock()
-		defer t.callbackLock.Unlock()
-
-		// Find the index for the handler.
-		index := -1
-		for i, handler := range t.callbacks {
-			if handler.handlerID == id {
-				index = i
-				break
-			}
-		}
-
-		if index < 0 {
-			// not found
-			return
-		}
-
-		// it's the last one
-		if len(t.callbacks) == 1 {
-			t.callbacks = []*callbackContainer[T]{}
-			return
-		}
-
-		// delete it
-		t.callbacks = append(t.callbacks[:index], t.callbacks[index+1:]...)
+	if index < 0 {
+		// not found
+		return
 	}
+
+	// it's the last one
+	if len(u.topic.callbacks) == 1 {
+		u.topic.callbacks = []*callbackContainer[T]{}
+		return
+	}
+
+	// delete it
+	u.topic.callbacks = append(u.topic.callbacks[:index], u.topic.callbacks[index+1:]...)
 }
