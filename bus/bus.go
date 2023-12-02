@@ -107,18 +107,21 @@ func (e *event[T]) run() {
 type subscribeEvent[T any] struct {
 	topic    *Topic[T]
 	callback *callbackContainer[T]
+	wg       *sync.WaitGroup
 }
 
 func (s *subscribeEvent[T]) run() {
 	s.topic.callbackLock.Lock()
 	defer s.topic.callbackLock.Unlock()
 	s.topic.callbacks = append(s.topic.callbacks, s.callback)
+	s.wg.Done()
 }
 
 // unsubscribeEvent is an internal event that delays callback removal
 type unsubscribeEvent[T any] struct {
 	topic      *Topic[T]
 	callbackID uint64
+	wg         *sync.WaitGroup
 }
 
 func (u *unsubscribeEvent[T]) run() {
@@ -147,4 +150,6 @@ func (u *unsubscribeEvent[T]) run() {
 
 	// delete it
 	u.topic.callbacks = append(u.topic.callbacks[:index], u.topic.callbacks[index+1:]...)
+
+	u.wg.Done()
 }

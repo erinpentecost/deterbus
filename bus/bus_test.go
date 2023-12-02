@@ -25,10 +25,12 @@ func TestSingleConsumer(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(msgCount)
 
-	unsub := topic.Subscribe(func(_ context.Context, i int) {
+	cbm := topic.Subscribe(func(_ context.Context, i int) {
 		defer wg.Done()
 		seen = append(seen, i)
 	})
+	cbm.Wait()
+	defer cbm.Unsubscribe()
 
 	for i := 0; i < msgCount; i++ {
 		i := i
@@ -42,8 +44,6 @@ func TestSingleConsumer(t *testing.T) {
 	for i := 0; i < msgCount; i++ {
 		require.Equal(t, i, seen[i])
 	}
-
-	unsub()
 }
 
 func TestSingleConsumerWithWait(t *testing.T) {
@@ -55,9 +55,11 @@ func TestSingleConsumerWithWait(t *testing.T) {
 
 	seen := []int{}
 
-	unsub := topic.Subscribe(func(_ context.Context, i int) {
+	cbm := topic.Subscribe(func(_ context.Context, i int) {
 		seen = append(seen, i)
 	})
+	cbm.Wait()
+	defer cbm.Unsubscribe()
 
 	for i := 0; i < msgCount; i++ {
 		i := i
@@ -71,8 +73,6 @@ func TestSingleConsumerWithWait(t *testing.T) {
 	for i := 0; i < msgCount; i++ {
 		require.Equal(t, i, seen[i])
 	}
-
-	unsub()
 }
 
 func TestMultiConsumer(t *testing.T) {
@@ -87,14 +87,15 @@ func TestMultiConsumer(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(msgCount * consumerCount)
 
-	unsubs := []Unsubscribe{}
+	cbms := []CallbackManager{}
 
 	for i := 0; i < consumerCount; i++ {
-		unsub := topic.Subscribe(func(_ context.Context, i int) {
+		cbm := topic.Subscribe(func(_ context.Context, i int) {
 			defer wg.Done()
 			seen = append(seen, i)
 		})
-		unsubs = append(unsubs, unsub)
+		cbm.Wait()
+		cbms = append(cbms, cbm)
 	}
 
 	for i := 0; i < msgCount; i++ {
@@ -114,8 +115,8 @@ func TestMultiConsumer(t *testing.T) {
 		}
 	}
 
-	for _, unsub := range unsubs {
-		unsub()
+	for _, cbm := range cbms {
+		cbm.Unsubscribe()
 	}
 
 }
@@ -142,14 +143,14 @@ func TestMultiTopic(t *testing.T) {
 			wg := &sync.WaitGroup{}
 			wg.Add(msgCount * consumerCount)
 
-			unsubs := []Unsubscribe{}
+			cbms := []CallbackManager{}
 
 			for i := 0; i < consumerCount; i++ {
 				unsub := topic.Subscribe(func(_ context.Context, i int) {
 					defer wg.Done()
 					seen = append(seen, i)
 				})
-				unsubs = append(unsubs, unsub)
+				cbms = append(cbms, unsub)
 			}
 
 			// don't start publishing until all topics are ready
@@ -173,10 +174,109 @@ func TestMultiTopic(t *testing.T) {
 				}
 			}
 
-			for _, unsub := range unsubs {
-				unsub()
+			for _, unsub := range cbms {
+				unsub.Unsubscribe()
 			}
 		}(b)
 	}
 	topicWG.Wait()
+}
+
+func TestChaining(t *testing.T) {
+	msgCount := 50000
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount)
+
+	b := New(Context(t))
+	topicA := NewTopic[int](b)
+	topicB := NewTopic[int](b)
+	topicC := NewTopic[int](b)
+
+	cbma := topicA.Subscribe(func(ctx context.Context, i int) {
+		topicB.Publish(ctx, i)
+	})
+	defer cbma.Unsubscribe()
+
+	cbmb := topicB.Subscribe(func(ctx context.Context, i int) {
+		topicC.Publish(ctx, i)
+	})
+	defer cbmb.Unsubscribe()
+
+	cbmC := topicC.Subscribe(func(ctx context.Context, i int) {
+		defer wg.Done()
+		seen = append(seen, i)
+	})
+	defer cbmC.Unsubscribe()
+
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topicA.Publish(context.TODO(), i)
+	}
+
+	wg.Wait()
+	require.Len(t, seen, msgCount)
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
+}
+
+func TestSubscriptionDeterminism(t *testing.T) {
+	msgCount := 500
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount)
+
+	b := New(Context(t))
+	topic := NewTopic[int](b)
+
+	type ctxKey string
+	whenKey := ctxKey("when")
+
+	// send a bunch of events before subscription
+	// hold a lock on the bus to make sure we have a backlog
+	contextBefore := context.WithValue(context.Background(), whenKey, -1)
+	for i := 0; i < (1+msgCount)/100; i++ {
+		for j := -1; j > -100; j++ {
+			topic.Publish(contextBefore, (j)*(i+1)).Wait()
+		}
+	}
+
+	cbm := topic.Subscribe(func(ctx context.Context, i int) {
+		defer wg.Done()
+		switch ctx.Value(whenKey).(int) {
+		case -1:
+			t.Fatalf("received events before subscription")
+		case 0:
+			seen = append(seen, i)
+		case 1:
+			t.Fatalf("received events after subscription")
+		default:
+			t.Fatalf("bad key value")
+		}
+	})
+	cbm.Wait()
+
+	// send events after subscription
+	contextDuring := context.WithValue(context.Background(), whenKey, 0)
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topic.Publish(contextDuring, i).Wait()
+	}
+
+	cbm.Unsubscribe()()
+
+	// send a bunch of events after unsubscription
+	contextAfter := context.WithValue(context.Background(), whenKey, 1)
+	for i := 0; i < 1000; i++ {
+		topic.Publish(contextAfter, -10000000*(i+1))
+	}
+
+	wg.Wait()
+	require.Len(t, seen, msgCount)
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
 }
