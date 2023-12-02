@@ -2,7 +2,6 @@ package bus
 
 import (
 	"context"
-	"math"
 	"sync"
 	"sync/atomic"
 
@@ -31,12 +30,16 @@ func New() *Bus {
 
 func NewTopic[T any](bus *Bus) *Topic[T] {
 	t := &Topic[T]{
-		bus:                  bus,
-		pendingEvents:        queue.New(),
-		oldestPendingEventID: eventID(math.MaxUint64),
+		bus:           bus,
+		pendingEvents: queue.New(),
 	}
 
 	// start consumer multiplexer
+	// TODO: it would be better if there was just single event channel
+	// on the bus. that's messed up because of generics limitations
+	// (if I could have a queue[T] of mixed Ts this would be easy,
+	// but I also need to un-mix them and call the callbacks without reflection,
+	// because reflection is slow. pick your poison)
 	// TODO: stop this goroutine from leaking
 	go t.multiplexEventsToCallbacks()
 
@@ -62,9 +65,8 @@ type event[T any] struct {
 type Topic[T any] struct {
 	bus *Bus
 
-	queueLock            sync.Mutex
-	pendingEvents        *queue.Queue
-	oldestPendingEventID eventID
+	queueLock     sync.Mutex
+	pendingEvents *queue.Queue
 
 	// newer callbacks must go on the end
 	callbackLock   sync.Mutex
@@ -74,29 +76,28 @@ type Topic[T any] struct {
 
 func (t *Topic[T]) multiplexEventsToCallbacks() {
 	for {
-		// this wont ever unlock because we only broadcast this in one spot
-		// we need to also trigger if oldestPendingEventID changes
 		t.bus.lastCompletedEventCond.L.Lock()
-		for t.bus.lastCompletedEvent != t.oldestPendingEventID-1 {
+		for !t.shouldRun() {
 			t.bus.lastCompletedEventCond.Wait()
 		}
+		t.bus.lastCompletedEventCond.L.Unlock()
 
 		// pop event
 		t.queueLock.Lock()
 		event := t.pendingEvents.Remove().(event[T])
-
-		t.updateOldest()
 		t.queueLock.Unlock()
 
 		// multiplex to callbacks here
+		// don't hold a lock on t.bus.lastCompletedEventCond.L here
+		// because these callbacks may be Wait()ing on publishes.
 		for _, cc := range t.callbacks {
 			cc.fn(event.ctxArg, event.arg)
 		}
 
 		// let everyone know the id increased
-		t.bus.lastCompletedEvent++
+		t.bus.lastCompletedEventCond.L.Lock()
+		t.bus.lastCompletedEvent = event.id
 		t.bus.lastCompletedEventCond.Broadcast()
-
 		t.bus.lastCompletedEventCond.L.Unlock()
 	}
 }
@@ -119,30 +120,43 @@ func (p *publishWaiter[T]) Wait() {
 }
 
 func (t *Topic[T]) Publish(ctx context.Context, arg T) Waiter {
+	// lock queue and place event in it
+	t.queueLock.Lock()
+
 	// reserve event id
 	id := eventID(t.bus.nextEventID.Add(1))
 
-	// lock queue and place event in it
-	t.queueLock.Lock()
 	t.pendingEvents.Add(event[T]{
 		ctxArg: ctx,
 		arg:    arg,
 		id:     id,
 	})
-	t.updateOldest()
 	t.queueLock.Unlock()
+
+	// this is not ideal because it wakes up all topics, when it could
+	// just wake up this one.
+	t.bus.lastCompletedEventCond.Broadcast()
 
 	return &publishWaiter[T]{topic: t, waitForID: id}
 }
 
-// updateOldest updates t.oldestPendingEventID.
-// make sure you lock t.queueLock while calling
-func (t *Topic[T]) updateOldest() {
+func (t *Topic[T]) oldestPendingEventID() *eventID {
+	t.queueLock.Lock()
+	defer t.queueLock.Unlock()
 	if t.pendingEvents.Length() == 0 {
-		return
+		return nil
 	}
-	event := t.pendingEvents.Peek().(event[T])
-	t.oldestPendingEventID = event.id
+	id := t.pendingEvents.Peek().(event[T]).id
+	return &id
+}
+
+// hold lastCompletedEventCond.L when calling
+func (t *Topic[T]) shouldRun() bool {
+	id := t.oldestPendingEventID()
+	if id == nil {
+		return false
+	}
+	return t.bus.lastCompletedEvent+1 == *id
 }
 
 func (t *Topic[T]) Subscribe(callback Callback[T]) Unsubscribe {

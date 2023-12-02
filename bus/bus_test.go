@@ -16,15 +16,12 @@ func TestSingleConsumer(t *testing.T) {
 
 	msgCount := 50000
 
-	seenMux := &sync.Mutex{}
 	seen := []int{}
 	wg := &sync.WaitGroup{}
 	wg.Add(msgCount)
 
 	unsub := topic.Subscribe(func(_ context.Context, i int) {
 		defer wg.Done()
-		seenMux.Lock()
-		defer seenMux.Unlock()
 		seen = append(seen, i)
 	})
 
@@ -44,15 +41,43 @@ func TestSingleConsumer(t *testing.T) {
 	unsub()
 }
 
-func TestSingleMultiConsumer(t *testing.T) {
+func TestSingleConsumerWithWait(t *testing.T) {
 
 	b := New()
 	topic := NewTopic[int](b)
 
-	msgCount := 50000
+	msgCount := 5
+
+	seen := []int{}
+
+	unsub := topic.Subscribe(func(_ context.Context, i int) {
+		seen = append(seen, i)
+	})
+
+	for i := 0; i < msgCount; i++ {
+		i := i
+		w := topic.Publish(context.TODO(), i)
+		w.Wait()
+	}
+
+	require.Len(t, seen, msgCount)
+
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
+
+	unsub()
+}
+
+func TestMultiConsumer(t *testing.T) {
+
+	b := New()
+	topic := NewTopic[int](b)
+
+	msgCount := 5000
 	consumerCount := 100
 
-	seenMux := &sync.Mutex{}
 	seen := []int{}
 	wg := &sync.WaitGroup{}
 	wg.Add(msgCount * consumerCount)
@@ -62,8 +87,6 @@ func TestSingleMultiConsumer(t *testing.T) {
 	for i := 0; i < consumerCount; i++ {
 		unsub := topic.Subscribe(func(_ context.Context, i int) {
 			defer wg.Done()
-			seenMux.Lock()
-			defer seenMux.Unlock()
 			seen = append(seen, i)
 		})
 		unsubs = append(unsubs, unsub)
@@ -90,4 +113,66 @@ func TestSingleMultiConsumer(t *testing.T) {
 		unsub()
 	}
 
+}
+
+func TestMultiTopic(t *testing.T) {
+
+	b := New()
+
+	topicCount := 200
+	msgCount := 1000
+	consumerCount := 20
+
+	topicWG := &sync.WaitGroup{}
+	topicWG.Add(topicCount)
+
+	syncBeforePublish := &sync.WaitGroup{}
+	syncBeforePublish.Add(topicCount)
+	for i := 0; i < topicCount; i++ {
+		go func(b *Bus) {
+			defer topicWG.Done()
+			topic := NewTopic[int](b)
+
+			seen := []int{}
+			wg := &sync.WaitGroup{}
+			wg.Add(msgCount * consumerCount)
+
+			unsubs := []Unsubscribe{}
+
+			for i := 0; i < consumerCount; i++ {
+				unsub := topic.Subscribe(func(_ context.Context, i int) {
+					defer wg.Done()
+					seen = append(seen, i)
+				})
+				unsubs = append(unsubs, unsub)
+			}
+
+			// don't start publishing until all topics are ready
+			syncBeforePublish.Done()
+			syncBeforePublish.Wait()
+
+			for i := 0; i < msgCount; i++ {
+				i := i
+				topic.Publish(context.TODO(), i)
+			}
+			wg.Wait()
+
+			require.Len(t, seen, msgCount*consumerCount)
+
+			slices.Sort(seen)
+
+			for m := 0; m < msgCount; m++ {
+				for h := 0; h < consumerCount; h++ {
+					idx := m*consumerCount + h
+					require.Equal(t, m, seen[idx], "consumer %d, msg %d, idx %d", h, m, idx)
+				}
+			}
+
+			for _, unsub := range unsubs {
+				unsub()
+			}
+		}(b)
+	}
+	topicWG.Wait()
+	require.Equal(t, topicCount*msgCount, int(b.nextEventID.Load()))
 }
