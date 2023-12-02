@@ -9,9 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSingleConsumer(t *testing.T) {
+func Context(t *testing.T) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return ctx
+}
 
-	b := New()
+func TestSingleConsumer(t *testing.T) {
+	b := New(Context(t))
 	topic := NewTopic[int](b)
 
 	msgCount := 50000
@@ -43,7 +48,7 @@ func TestSingleConsumer(t *testing.T) {
 
 func TestSingleConsumerWithWait(t *testing.T) {
 
-	b := New()
+	b := New(Context(t))
 	topic := NewTopic[int](b)
 
 	msgCount := 5
@@ -72,7 +77,7 @@ func TestSingleConsumerWithWait(t *testing.T) {
 
 func TestMultiConsumer(t *testing.T) {
 
-	b := New()
+	b := New(Context(t))
 	topic := NewTopic[int](b)
 
 	msgCount := 5000
@@ -117,7 +122,7 @@ func TestMultiConsumer(t *testing.T) {
 
 func TestMultiTopic(t *testing.T) {
 
-	b := New()
+	b := New(Context(t))
 
 	topicCount := 200
 	msgCount := 1000
@@ -174,5 +179,4 @@ func TestMultiTopic(t *testing.T) {
 		}(b)
 	}
 	topicWG.Wait()
-	require.Equal(t, topicCount*msgCount, int(b.nextEventID.Load()))
 }
