@@ -137,6 +137,8 @@ func (u *unsubscribeEvent[T]) run() {
 		}
 	}
 
+	defer u.wg.Done()
+
 	if index < 0 {
 		// not found
 		return
@@ -150,6 +152,4 @@ func (u *unsubscribeEvent[T]) run() {
 
 	// delete it
 	u.topic.callbacks = append(u.topic.callbacks[:index], u.topic.callbacks[index+1:]...)
-
-	u.wg.Done()
 }

@@ -30,7 +30,6 @@ func TestSingleConsumer(t *testing.T) {
 		seen = append(seen, i)
 	})
 	cbm.Wait()
-	defer cbm.Unsubscribe()
 
 	for i := 0; i < msgCount; i++ {
 		i := i
@@ -44,6 +43,10 @@ func TestSingleConsumer(t *testing.T) {
 	for i := 0; i < msgCount; i++ {
 		require.Equal(t, i, seen[i])
 	}
+
+	cbm.Unsubscribe()()
+	// do it again just for coverage
+	cbm.Unsubscribe()()
 }
 
 func TestSingleConsumerWithWait(t *testing.T) {
@@ -59,7 +62,6 @@ func TestSingleConsumerWithWait(t *testing.T) {
 		seen = append(seen, i)
 	})
 	cbm.Wait()
-	defer cbm.Unsubscribe()
 
 	for i := 0; i < msgCount; i++ {
 		i := i
@@ -73,6 +75,9 @@ func TestSingleConsumerWithWait(t *testing.T) {
 	for i := 0; i < msgCount; i++ {
 		require.Equal(t, i, seen[i])
 	}
+
+	unsubber := cbm.Unsubscribe()
+	unsubber()
 }
 
 func TestMultiConsumer(t *testing.T) {
@@ -237,10 +242,8 @@ func TestSubscriptionDeterminism(t *testing.T) {
 	// send a bunch of events before subscription
 	// hold a lock on the bus to make sure we have a backlog
 	contextBefore := context.WithValue(context.Background(), whenKey, -1)
-	for i := 0; i < (1+msgCount)/100; i++ {
-		for j := -1; j > -100; j++ {
-			topic.Publish(contextBefore, (j)*(i+1)).Wait()
-		}
+	for i := 0; i < msgCount; i++ {
+		topic.Publish(contextBefore, (i + 1))
 	}
 
 	cbm := topic.Subscribe(func(ctx context.Context, i int) {
@@ -262,7 +265,7 @@ func TestSubscriptionDeterminism(t *testing.T) {
 	contextDuring := context.WithValue(context.Background(), whenKey, 0)
 	for i := 0; i < msgCount; i++ {
 		i := i
-		topic.Publish(contextDuring, i).Wait()
+		topic.Publish(contextDuring, i)
 	}
 
 	cbm.Unsubscribe()()
