@@ -1,345 +1,286 @@
-package deterbus
+package deterbus_test
 
 import (
 	"context"
-	"fmt"
-	"reflect"
 	"slices"
 	"sync"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/erinpentecost/deterbus"
 	"github.com/stretchr/testify/require"
 )
 
-func TestConstructor(t *testing.T) {
-	b := New()
-	b.Stop()
+func Context(t *testing.T) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return ctx
 }
 
-func TestEmptyDrain(t *testing.T) {
-	b := New()
-	<-b.DrainStop()
+func TestSingleConsumer(t *testing.T) {
+	b := deterbus.NewBus(Context(t))
+	topic := deterbus.NewTopic[int](b)
+
+	msgCount := 50000
+
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount)
+
+	cbm := topic.Subscribe(func(_ context.Context, i int) {
+		defer wg.Done()
+		seen = append(seen, i)
+	})
+	cbm.Wait()
+
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topic.Publish(context.TODO(), i)
+	}
+	wg.Wait()
+
+	require.Len(t, seen, msgCount)
+
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
+
+	cbm.Unsubscribe()()
+	// do it again just for coverage
+	cbm.Unsubscribe()()
 }
 
-func TestFnType(t *testing.T) {
-	sampleFn := func() bool {
-		return true
+func TestSingleConsumerWithWait(t *testing.T) {
+
+	b := deterbus.NewBus(Context(t))
+	topic := deterbus.NewTopic[int](b)
+
+	msgCount := 5
+
+	seen := []int{}
+
+	cbm := topic.Subscribe(func(_ context.Context, i int) {
+		seen = append(seen, i)
+	})
+	cbm.Wait()
+
+	for i := 0; i < msgCount; i++ {
+		i := i
+		w := topic.Publish(context.TODO(), i)
+		w.Wait()
 	}
 
-	assert.Equal(t, reflect.Func, reflect.TypeOf(sampleFn).Kind())
-	assert.Equal(t, reflect.Func, reflect.TypeOf(TestFnType).Kind())
+	require.Len(t, seen, msgCount)
+
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
+
+	unsubber := cbm.Unsubscribe()
+	unsubber()
 }
 
-func TestSubscribe(t *testing.T) {
-	b := New()
-	defer b.Stop()
+func TestMultiConsumer(t *testing.T) {
 
-	receiveCount := 0
+	b := deterbus.NewBus(Context(t))
+	topic := deterbus.NewTopic[int](b)
 
-	handler := func(_ context.Context, _ int) {
-		receiveCount++
-	}
+	msgCount := 5000
+	consumerCount := 100
 
-	dummyTopicA := NewTopic(b, TopicDefinition[int]{})
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount * consumerCount)
 
-	done, _ := dummyTopicA.Subscribe(handler)
-	<-done
-}
+	cbms := []deterbus.CallbackManager{}
 
-func send(t testing.TB, b *Bus, syncTxn bool, handlerCount int, messageCount int) {
-
-	// make a shared handler that just records whatever
-	// int is sent to it in a slice.
-	pubsLocker := &sync.Mutex{}
-	pubsSeen := make([]int, 0)
-	handler := func(_ context.Context, id int) {
-		pubsLocker.Lock()
-		pubsSeen = append(pubsSeen, id)
-		pubsLocker.Unlock()
-	}
-
-	// make one topic
-	topic := NewTopic(b, TopicDefinition[int]{})
-
-	// register the handler multiple times on the topic.
-	// we should get handlerCount copies of each message
-	// in pubsSeen
-	for i := 0; i < handlerCount; i++ {
-		s, _ := topic.Subscribe(handler)
-		<-s
-	}
-
-	// send a bunch of messages in any order
-	ctx := context.TODO()
-	var wg sync.WaitGroup
-	wg.Add(messageCount)
-	for i := 0; i < messageCount; i++ {
-		go func(id int) {
+	for i := 0; i < consumerCount; i++ {
+		cbm := topic.Subscribe(func(_ context.Context, i int) {
 			defer wg.Done()
-			if syncTxn {
-				p, err := topic.PublishSerially(ctx, id)
-				require.NoError(t, err)
-				<-p
-			} else {
-				p, err := topic.Publish(ctx, id)
-				require.NoError(t, err)
-				<-p
-			}
-		}(i)
+			seen = append(seen, i)
+		})
+		cbm.Wait()
+		cbms = append(cbms, cbm)
 	}
-	wg.Wait() // wait until all sent
 
-	require.Equal(t, handlerCount*messageCount, len(pubsSeen), "publishes missing")
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topic.Publish(context.TODO(), i)
+	}
+	wg.Wait()
 
-	slices.Sort(pubsSeen)
+	require.Len(t, seen, msgCount*consumerCount)
 
-	for h := 0; h < handlerCount; h++ {
-		for m := 0; m < messageCount; m++ {
-			require.Equal(t, m, pubsSeen[(h+1)*m])
+	slices.Sort(seen)
+
+	for m := 0; m < msgCount; m++ {
+		for h := 0; h < consumerCount; h++ {
+			idx := m*consumerCount + h
+			require.Equal(t, m, seen[idx], "consumer %d, msg %d, idx %d", h, m, idx)
 		}
 	}
+
+	for _, cbm := range cbms {
+		cbm.Unsubscribe()
+	}
+
 }
 
-func TestPublishSingleSubscriberAsync(t *testing.T) {
-	b := New()
-	defer b.Stop()
+func TestMultiTopic(t *testing.T) {
 
-	send(t, b, false, 1, 2000)
-}
+	b := deterbus.NewBus(Context(t))
 
-func TestPublishSingleSubscriberSync(t *testing.T) {
-	b := New()
-	defer b.Stop()
+	topicCount := 200
+	msgCount := 1000
+	consumerCount := 20
 
-	send(t, b, true, 1, 2000)
-}
+	topicWG := &sync.WaitGroup{}
+	topicWG.Add(topicCount)
 
-func TestPublishManySubscribersAsync(t *testing.T) {
-	b := New()
-	defer b.Stop()
-
-	topicCount := 2000
-	var wg sync.WaitGroup
-	wg.Add(topicCount)
-
+	syncBeforePublish := &sync.WaitGroup{}
+	syncBeforePublish.Add(topicCount)
 	for i := 0; i < topicCount; i++ {
-		go func(topic uint64) {
-			defer wg.Done()
-			send(t, b, false, 1, 100)
-		}(uint64(i))
-	}
+		go func(b *deterbus.Bus) {
+			defer topicWG.Done()
+			topic := deterbus.NewTopic[int](b)
 
-	wg.Wait()
-}
+			seen := []int{}
+			wg := &sync.WaitGroup{}
+			wg.Add(msgCount * consumerCount)
 
-func TestPublishManySubscribersSync(t *testing.T) {
-	b := New()
-	defer b.Stop()
+			cbms := []deterbus.CallbackManager{}
 
-	topicCount := 2000
-	var wg sync.WaitGroup
-	wg.Add(topicCount)
-
-	for i := 0; i < topicCount; i++ {
-		go func(topic int) {
-			defer wg.Done()
-			send(t, b, true, 1, 100)
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-func TestContextPublish(t *testing.T) {
-	bus := New()
-	defer bus.Stop()
-
-	var foundTopic TopicIdentifier
-	foundNum := uint64(4444)
-
-	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
-
-	expectedTopic := dummyTopicA.id.id
-
-	handler := func(ctx context.Context, _ int) {
-		foundTopic = ctx.Value(EventTopic).(TopicIdentifier)
-		foundNum = ctx.Value(EventNumber).(uint64)
-	}
-
-	s, _ := dummyTopicA.Subscribe(handler)
-	<-s
-
-	p, _ := dummyTopicA.Publish(context.Background(), 4)
-	<-p
-
-	assert.Equal(t, expectedTopic, foundTopic.ID())
-	// we should be on the second publish, because
-	// a subscribe is internally treated as a publish
-	assert.Equal(t, uint64(2), foundNum)
-}
-
-func TestWait(t *testing.T) {
-	bus := New()
-	defer bus.Stop()
-
-	<-bus.Wait() // check brand-new empty bus
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-
-	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
-	s, _ := dummyTopicA.Subscribe(func(_ context.Context, _ int) { wg.Wait() })
-	<-s
-
-	// set up new goroutine that will wait until wg is Done,
-	// then signal it's done via waitDone
-	waitDone := sync.WaitGroup{}
-	waitDone.Add(1)
-	go func() {
-		defer waitDone.Done()
-		// this will hang until wg is Done()
-		<-bus.Wait()
-	}()
-
-	p, _ := dummyTopicA.Publish(context.TODO(), 0)
-
-	// at this point, the handler is "running" trying to finish the event
-
-	wg.Done() // finish the handler
-
-	waitDone.Wait() // confirm the pending wait finished
-
-	<-p // confirm the consume done signal is tripped
-
-	<-bus.Wait() // check now-empty bus
-}
-
-type DummyInterface interface {
-	Ok() bool
-}
-
-type DummyStruct struct {
-	bool
-}
-
-func (d DummyStruct) Ok() bool {
-	return d.bool
-}
-
-func TestPublishWithNoSubscriber(t *testing.T) {
-	bus := New()
-	defer bus.DrainStop()
-
-	// This should complete and not time out.
-	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
-	p, _ := dummyTopicA.Publish(context.Background(), 99999)
-	<-p
-}
-
-type multiSubmessage struct {
-	locker *sync.Mutex
-	resmap *map[int]int
-}
-
-func TestPublishMultipleSubscribers(t *testing.T) {
-	bus := New()
-
-	subCount := 100
-	pubCount := 400
-
-	var resLock sync.Mutex
-	res := make(map[int]int)
-
-	dummyTopicA := NewTopic(bus, TopicDefinition[*multiSubmessage]{})
-
-	var wg sync.WaitGroup
-	wg.Add(subCount)
-	for i := 0; i < subCount; i++ {
-		go func(handlerid int) {
-			defer wg.Done()
-			s, _ := dummyTopicA.Subscribe(func(_ context.Context, msg *multiSubmessage) {
-				msg.locker.Lock()
-				defer msg.locker.Unlock()
-				v, ok := (*msg.resmap)[handlerid]
-				if ok {
-					(*msg.resmap)[handlerid] = v + 1
-				} else {
-					(*msg.resmap)[handlerid] = 1
-				}
-			})
-			<-s
-		}(i)
-	}
-
-	wg.Wait()
-
-	for p := 0; p < pubCount; p++ {
-		d, er := dummyTopicA.Publish(context.Background(), &multiSubmessage{locker: &resLock, resmap: &res})
-		assert.Nil(t, er, "publish failed")
-		<-d
-	}
-
-	<-bus.DrainStop()
-
-	for i := 0; i < subCount; i++ {
-		_, ok := res[i]
-		assert.True(t, ok, fmt.Sprintf("missing handler responses for handler %v", i))
-	}
-}
-
-// BenchmarkSinglePublish benchmarks one publish vs one subscriber.
-func BenchmarkSinglePublish(b *testing.B) {
-	bus := New()
-	defer bus.Stop()
-
-	dummyTopicA := NewTopic(bus, TopicDefinition[int]{})
-
-	handler := func(_ context.Context, _ int) {
-		// no op
-	}
-
-	s, _ := dummyTopicA.Subscribe(handler)
-	<-s
-
-	for n := 0; n < b.N; n++ {
-		p, _ := dummyTopicA.Publish(context.TODO(), 0)
-		<-p
-	}
-}
-
-func BenchmarkLoad(b *testing.B) {
-	// 40 seconds
-	topicCount := 50
-	messagesPerTopic := 1000
-	handlersPerTopic := 1000
-
-	for n := 0; n < b.N; n++ {
-		bus := New()
-		defer bus.Stop()
-
-		var wg sync.WaitGroup
-		wg.Add(topicCount * messagesPerTopic * handlersPerTopic)
-
-		topics := []*Topic[int]{}
-		for i := 0; i < topicCount; i++ {
-			topic := NewTopic(bus, TopicDefinition[int]{})
-			topics = append(topics, topic)
-			for i := 0; i < handlersPerTopic; i++ {
-				s, _ := topic.Subscribe(func(_ context.Context, _ int) {
-					wg.Done()
+			for i := 0; i < consumerCount; i++ {
+				unsub := topic.Subscribe(func(_ context.Context, i int) {
+					defer wg.Done()
+					seen = append(seen, i)
 				})
-				<-s
+				cbms = append(cbms, unsub)
 			}
-		}
 
-		for i := 0; i < topicCount; i++ {
-			topic := topics[i]
-			for i := 0; i < messagesPerTopic; i++ {
-				topic.Publish(context.TODO(), 0)
+			// don't start publishing until all topics are ready
+			syncBeforePublish.Done()
+			syncBeforePublish.Wait()
+
+			for i := 0; i < msgCount; i++ {
+				i := i
+				topic.Publish(context.TODO(), i)
 			}
-		}
+			wg.Wait()
 
-		wg.Wait()
+			require.Len(t, seen, msgCount*consumerCount)
+
+			slices.Sort(seen)
+
+			for m := 0; m < msgCount; m++ {
+				for h := 0; h < consumerCount; h++ {
+					idx := m*consumerCount + h
+					require.Equal(t, m, seen[idx], "consumer %d, msg %d, idx %d", h, m, idx)
+				}
+			}
+
+			for _, unsub := range cbms {
+				unsub.Unsubscribe()
+			}
+		}(b)
+	}
+	topicWG.Wait()
+}
+
+func TestChaining(t *testing.T) {
+	msgCount := 50000
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount)
+
+	b := deterbus.NewBus(Context(t))
+	topicA := deterbus.NewTopic[int](b)
+	topicB := deterbus.NewTopic[int](b)
+	topicC := deterbus.NewTopic[int](b)
+
+	cbma := topicA.Subscribe(func(ctx context.Context, i int) {
+		topicB.Publish(ctx, i)
+	})
+	defer cbma.Unsubscribe()
+
+	cbmb := topicB.Subscribe(func(ctx context.Context, i int) {
+		topicC.Publish(ctx, i)
+	})
+	defer cbmb.Unsubscribe()
+
+	cbmC := topicC.Subscribe(func(ctx context.Context, i int) {
+		defer wg.Done()
+		seen = append(seen, i)
+	})
+	defer cbmC.Unsubscribe()
+
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topicA.Publish(context.TODO(), i)
+	}
+
+	wg.Wait()
+	require.Len(t, seen, msgCount)
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
+	}
+}
+
+func TestSubscriptionDeterminism(t *testing.T) {
+	msgCount := 500
+	seen := []int{}
+	wg := &sync.WaitGroup{}
+	wg.Add(msgCount)
+
+	b := deterbus.NewBus(Context(t))
+	topic := deterbus.NewTopic[int](b)
+
+	type ctxKey string
+	whenKey := ctxKey("when")
+
+	// send a bunch of events before subscription
+	// hold a lock on the bus to make sure we have a backlog
+	contextBefore := context.WithValue(context.Background(), whenKey, -1)
+	for i := 0; i < msgCount; i++ {
+		topic.Publish(contextBefore, (i + 1))
+	}
+
+	cbm := topic.Subscribe(func(ctx context.Context, i int) {
+		defer wg.Done()
+		switch ctx.Value(whenKey).(int) {
+		case -1:
+			t.Fatalf("received events before subscription")
+		case 0:
+			seen = append(seen, i)
+		case 1:
+			t.Fatalf("received events after subscription")
+		default:
+			t.Fatalf("bad key value")
+		}
+	})
+	cbm.Wait()
+
+	// send events after subscription
+	contextDuring := context.WithValue(context.Background(), whenKey, 0)
+	for i := 0; i < msgCount; i++ {
+		i := i
+		topic.Publish(contextDuring, i)
+	}
+
+	cbm.Unsubscribe()()
+
+	// send a bunch of events after unsubscription
+	contextAfter := context.WithValue(context.Background(), whenKey, 1)
+	for i := 0; i < 1000; i++ {
+		topic.Publish(contextAfter, -10000000*(i+1))
+	}
+
+	wg.Wait()
+	require.Len(t, seen, msgCount)
+	slices.Sort(seen)
+	for i := 0; i < msgCount; i++ {
+		require.Equal(t, i, seen[i])
 	}
 }

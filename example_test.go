@@ -9,45 +9,41 @@ import (
 )
 
 func TestExample(t *testing.T) {
-	b := deterbus.New() // Create a new Bus.
-	defer b.Stop()      // Make sure we don't leave any orphaned events when we leave scope.
+	// Create a new Bus. We'll want to cancel the context we pass in eventually so we
+	// don't leak a goroutine.
+	ctx, cancel := context.WithCancel(context.Background())
+	b := deterbus.NewBus(ctx)
+	defer cancel()
 
 	// Create a new topic for tracking changes to our bank account
 	// so we can maintain a balance. We specify the type of the argument
 	// we are going to send along with the event with the help of generics.
-	bankAccountValueChangeTopic := deterbus.NewTopic(b, deterbus.TopicDefinition[int]{})
+	accountChange := deterbus.NewTopic[int](b)
 
 	// Create our handler.
+	// Callbacks are invoked one-at-a-time, so we don't need a mutex around to protect
+	// the `balance` variable here.
 	balance := 0
 	handlerFn := func(_ context.Context, delta int) {
-		// We don't care about the context in this example.
 		balance += delta
 	}
 
 	// Register a handler on the topic.
-	// Subscription is an asynchronous call, so let's wait until the handler is ready by
-	// calling "<-" on the returned done-ness channel.
-	// If we don't wait, and instead Publish right away, the Publish may complete before
-	// the Subscribe. In that case, the event would be lost.
-	done, unsub := bankAccountValueChangeTopic.Subscribe(handlerFn)
-	<-done // wait for subscribe to finish
+	// Subscription is an asynchronous call. It actually just does a Publish with an
+	// internal "subscribe" event. We can Wait() for that to finish or close the
+	// callback with the returned CallbackManager if we ever need to.
+	callbackManager := accountChange.Subscribe(handlerFn)
 
-	// Send a new event onto the bus.
-	done, err := bankAccountValueChangeTopic.Publish(context.TODO(), 99)
-	// Publication is also an asyncronous call. We can use the returned channel
-	// to wait for completion just like we did for subscription.
-	<-done
-	require.NoError(t, err, "Publish will only return an error if the bus is draining")
+	// Send a new event onto the bus. We're going to wait until all callbacks have finished.
+	accountChange.Publish(context.TODO(), 99).Wait()
 
 	require.Equal(t, 99, balance)
 
-	// Now we'll remove our handler and wait for it to finish.
-	<-unsub()
+	// Now we'll schedule the callback to be removed.
+	callbackManager.Unsubscribe()
 
 	// Let's see what happens when we try to withdraw a million dollars now.
-	done, err = bankAccountValueChangeTopic.Publish(context.TODO(), -1000000)
-	<-done
-	require.NoError(t, err, "Publish will only return an error if the bus is draining")
+	accountChange.Publish(context.TODO(), -1000000).Wait()
 
 	// There's no handler, so the event was dropped and not processed by anything.
 	require.Equal(t, 99, balance)
