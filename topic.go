@@ -2,109 +2,117 @@ package deterbus
 
 import (
 	"context"
-	"reflect"
+	"sync"
 	"sync/atomic"
 )
 
-// TopicIDType uniquely identifies a topic.
-type TopicIDType uint64
-
-var genericTopicID atomic.Uint64
-
-// TopicDefinition is a definition for a topic.
-// It exists to hold the type T.
-type TopicDefinition[T any] struct {
-	// Name can be set to provide a user-readable name.
-	// This might appear in logs.
-	Name string
-}
-
-// topicIdentifier is a container for the ID and a Name of a topic.
-type topicIdentifier struct {
-	id   TopicIDType
-	name string
-}
-
-type TopicIdentifier interface {
-	ID() TopicIDType
-	Name() string
-}
-
-func (ti *topicIdentifier) ID() TopicIDType {
-	return ti.id
-}
-
-func (ti *topicIdentifier) Name() string {
-	return ti.name
-}
-
-var _ TopicIdentifier = (*topicIdentifier)(nil)
-
-// RegisterOn registers a TopicDefinition onto a Bus to get a Topic.
-// You probably just want to use NewTopic().
-func (d *TopicDefinition[T]) RegisterOn(bus *Bus) *Topic[T] {
-	return &Topic[T]{
-		Bus:             bus,
-		TopicDefinition: *d,
-		id: &topicIdentifier{
-			id:   TopicIDType(genericTopicID.Add(1)),
-			name: d.Name,
-		},
-	}
-}
-
-// Topic is created by Registering a TopicDefinition on a Bus.
-// You can use this to publish and subscribe events on the Bus
-// for this Topic.
-//
-// Topics are more opinionated than using Bus methods directly,
-// but you get the benefit of compile-time type checking.
-//
-// All Topics pass in two arguments: a context and some T.
+// Topic is what users interact with.
+// Each one watches the station to know when it must run.
 type Topic[T any] struct {
-	Bus             *Bus
-	TopicDefinition TopicDefinition[T]
-	TopicType       reflect.Type
-	id              *topicIdentifier
+	bus *Bus
+
+	nextCallbackID *atomic.Uint64
+
+	// newer callbacks must go on the end
+	callbackLock *sync.Mutex
+	callbacks    []*callbackContainer[T]
 }
 
-// NewTopic registers a TopicDefinition onto a Bus to get a Topic.
-func NewTopic[T any](bus *Bus, d TopicDefinition[T]) *Topic[T] {
-	return d.RegisterOn(bus)
+// NewTopic creates a new topic on an event bus.
+func NewTopic[T any](bus *Bus) *Topic[T] {
+	t := &Topic[T]{
+		bus:            bus,
+		nextCallbackID: &atomic.Uint64{},
+		callbackLock:   &sync.Mutex{},
+		callbacks:      []*callbackContainer[T]{},
+	}
+	return t
 }
 
-// Publish arg to this topic. Handlers will be called concurrently and non-deterministically.
-// This will only return an error if the bus is draining.
-func (t *Topic[T]) Publish(ctx context.Context, arg T) (<-chan interface{}, error) {
-	return t.Bus.publish(
-		t.id,
-		ctx,
-		arg,
-	)
+// Waiter can be used to signal when all Subscribers have finished
+// processing an event.
+type Waiter interface {
+	Wait()
 }
 
-// PublishSerially arg to this topic. Handlers will be called serially and deterministically.
-// This will only return an error if the bus is draining.
-func (t *Topic[T]) PublishSerially(ctx context.Context, arg T) (<-chan interface{}, error) {
-	return t.Bus.publishSerially(
-		t.id,
-		ctx,
-		arg,
-	)
+// Publish submits an event to queue. When processed, it will be sent
+// to every Callback that is Subscribed to this Topic.
+func (t *Topic[T]) Publish(ctx context.Context, arg T) Waiter {
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	ev := &event[T]{
+		ctxArg: ctx,
+		arg:    arg,
+		topic:  t,
+		wg:     &wg,
+	}
+
+	t.bus.publish(ev)
+
+	return &wg
 }
 
-// Subscribe a handler to this topic.
-func (t *Topic[T]) Subscribe(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
-	return t.Bus.subscribe(
-		t.id,
-		fn,
-	)
+// Callbacks are hooked up to Topics via Subscription.
+// They are called for each Event that is Published to the Topic.
+type Callback[T any] func(context.Context, T)
+
+// CallbackManager contains utility functions for managing a callback.
+type CallbackManager interface {
+	// Wait will block until the publish is queued.
+	Wait()
+	// Unsubscribe will queue an event to unsubscribe the callback.
+	// The Wait function returned by Unsubscribe will block until that
+	// removal event is queued.
+	//
+	// Note that the callback may still be invoked even after
+	// CallbackManager.Unsubscribe()() is called if there is a backlog for
+	// this topic.
+	Unsubscribe() (Wait func())
 }
 
-// SubscribeOnce a handler to this topic. Once it receives an event, it will be unsubscribed.
-func (t *Topic[T]) SubscribeOnce(fn func(ctx context.Context, arg T)) (<-chan interface{}, Unsubscribe) {
-	return t.Bus.subscribeOnce(
-		t.id,
-		fn,
-	)
+type callbackManager struct {
+	wait        func()
+	unsubscribe func() func()
+}
+
+func (c *callbackManager) Wait() {
+	c.wait()
+}
+
+func (c *callbackManager) Unsubscribe() (Wait func()) {
+	return c.unsubscribe()
+}
+
+// Subscribe will invoke callback for each event Published to this topic.
+func (t *Topic[T]) Subscribe(callback Callback[T]) CallbackManager {
+	// increment id
+	id := t.nextCallbackID.Add(1)
+
+	cc := &callbackContainer[T]{
+		id: id,
+		fn: callback,
+	}
+
+	// publish callback sub event
+	pubDone := &sync.WaitGroup{}
+	pubDone.Add(1)
+	t.bus.publish(&subscribeEvent[T]{
+		topic:    t,
+		callback: cc,
+		wg:       pubDone,
+	})
+
+	// unsubscribe func
+	unsub := func() func() {
+		unsubDone := &sync.WaitGroup{}
+		unsubDone.Add(1)
+		t.bus.publish(&unsubscribeEvent[T]{
+			topic:      t,
+			callbackID: id,
+			wg:         unsubDone,
+		})
+		return unsubDone.Wait
+	}
+
+	return &callbackManager{wait: pubDone.Wait, unsubscribe: unsub}
 }

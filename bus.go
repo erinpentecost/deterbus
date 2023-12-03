@@ -2,426 +2,154 @@ package deterbus
 
 import (
 	"context"
-	"fmt"
-	"reflect"
-	"runtime"
 	"sync"
 
 	"github.com/eapache/queue"
 )
 
-// CtxKey is used to prevent collisions on additions
-// to the context passed in to Subscribers.
-type CtxKey int
+type runner interface {
+	run()
+}
 
-const (
-	// EventNumber uniquely identifies an event.
-	EventNumber CtxKey = iota
-	// EventTopic is the topic that invoked the handler.
-	EventTopic
-)
-
-var (
-	ErrDraining = fmt.Errorf("bus is draining; publish rejected")
-)
-
-// Bus is a deterministic* event bus.
+// Bus just controls when topic handlers are invoked.
 type Bus struct {
-	options         busOptions
-	publishedNumber uint64
-	consumedNumber  uint64
-	pendingEvents   *queue.Queue
-	listeners       map[TopicIDType]([]*eventHandler)
-	publishMethod   func(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error)
-	done            chan interface{}
-	queueLocker     *sync.Mutex
-	eventWatcher    *sync.Cond
-
-	subscribeTopic   *topicIdentifier
-	unsubscribeTopic *topicIdentifier
-	errorTopic       *topicIdentifier
+	eventCond *sync.Cond
+	// events is a queue of runners
+	events *queue.Queue
 }
 
-// New creates a new Bus.
-func New(opts ...BusOption) *Bus {
-	eb := Bus{
-		options:         buildOptions(opts...),
-		publishedNumber: 0,
-		consumedNumber:  0,
-		pendingEvents:   queue.New(),
-		listeners:       make(map[TopicIDType]([]*eventHandler)),
-		publishMethod:   publishNormal,
-		done:            make(chan interface{}),
-		queueLocker:     &sync.Mutex{},
-		eventWatcher:    sync.NewCond(&sync.Mutex{}),
-
-		subscribeTopic: &topicIdentifier{
-			id:   TopicIDType(genericTopicID.Add(1)),
-			name: "subscribe",
-		},
-		unsubscribeTopic: &topicIdentifier{
-			id:   TopicIDType(genericTopicID.Add(1)),
-			name: "unsubscribe",
-		},
-		errorTopic: &topicIdentifier{
-			id:   TopicIDType(genericTopicID.Add(1)),
-			name: "error",
-		},
+func NewBus(ctx context.Context) *Bus {
+	b := &Bus{
+		eventCond: sync.NewCond(&sync.Mutex{}),
+		events:    queue.New(),
 	}
 
-	// Subscribe and Unsubscribe are treated as events.
-	// This helps make the whole thing more deterministic.
-	// But to get this to work, we need to bootstrap them in.
-	subHandler := newHandler(eb.subscribeTopic, false, "contructor", subscribe)
-	unsubHandler := newHandler(eb.unsubscribeTopic, false, "constructor", unsubscribe)
+	// use wg so we don't return the bus until
+	// background goroutines have started.
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+	// trigger broadcast when context expires
+	go func(ctx context.Context, c *sync.Cond) {
+		wg.Done()
+		<-ctx.Done()
+		c.Broadcast()
+	}(ctx, b.eventCond)
 
-	eb.listeners[eb.subscribeTopic.id] = []*eventHandler{&subHandler}
-	eb.listeners[eb.unsubscribeTopic.id] = []*eventHandler{&unsubHandler}
+	go b.consume(ctx, wg)
 
-	// Start consumer.
-	go func() {
-		for {
-			select {
-			case <-eb.done:
-				return
-			default:
-				// TODO: Suspend the go routine instead of
-				// spinwaiting.
+	wg.Wait()
 
-				<-processEvent(&eb)
-			}
+	return b
+}
+
+func (b *Bus) publish(run runner) {
+	b.eventCond.L.Lock()
+	b.events.Add(run)
+	b.eventCond.Signal()
+	b.eventCond.L.Unlock()
+}
+
+// consume runs all the events on the queue
+func (b *Bus) consume(ctx context.Context, wg *sync.WaitGroup) {
+	wg.Done()
+	for {
+		// wait until there is work
+		b.eventCond.L.Lock()
+		for b.events.Length() == 0 && ctx.Err() == nil {
+			b.eventCond.Wait()
 		}
-	}()
-
-	return &eb
-}
-
-// Stop shuts down all event processing,
-// throwing away queued events.
-// Only call this when you are destroying the object,
-// since processing can't be restarted.
-func (eb *Bus) Stop() {
-	close(eb.done)
-}
-
-// DrainStop prevents new events from being published,
-// but will wait for already-queued events to finish
-// being consumed. The channel returned indicates
-// when draining is complete.
-// Once complete, the Bus will be closed down.
-// Only call this when you are destroying the object,
-// since events will be dropped while draining.
-func (eb *Bus) DrainStop() <-chan interface{} {
-
-	// Stop accepting new events
-	eb.queueLocker.Lock()
-	eb.publishMethod = publishDraining
-	eb.queueLocker.Unlock()
-
-	done := make(chan interface{})
-
-	go func() {
-		defer close(done)
-		// Loop until all events are gone.
-		eb.eventWatcher.L.Lock()
-		for eb.consumedNumber < eb.publishedNumber {
-			eb.eventWatcher.Wait()
+		// check if done
+		if ctx.Err() != nil {
+			return
 		}
-		eb.eventWatcher.L.Unlock()
+		// pop off work
+		run := b.events.Remove().(runner)
+		// release lock
+		b.eventCond.L.Unlock()
 
-		// Stop all processing.
-		eb.Stop()
-	}()
-
-	return done
-}
-
-// Wait returns a chan that will close when there
-// are no pending events that need to be processed.
-func (eb *Bus) Wait() <-chan interface{} {
-	done := make(chan interface{})
-
-	go func() {
-		defer close(done)
-		// Loop until all events are gone.
-		eb.eventWatcher.L.Lock()
-		for eb.consumedNumber < eb.publishedNumber {
-			eb.eventWatcher.Wait()
-		}
-		eb.eventWatcher.L.Unlock()
-	}()
-
-	return done
-}
-
-// publish adds an event to the queue. Handlers will be called concurrently.
-// The returned channel indicates when the event
-// has been completely consumed by subscribers (if any).
-func (eb *Bus) publish(topic *topicIdentifier, args ...interface{}) (<-chan interface{}, error) {
-	return eb.publishMethod(eb, topic, false, args...)
-}
-
-// publishSerially adds an event to the queue.
-// Listeners will process the event serially and deterministically.
-// The returned channel indicates when the event
-// has been completely consumed by subscribers (if any).
-func (eb *Bus) publishSerially(topic *topicIdentifier, args ...interface{}) (<-chan interface{}, error) {
-	return eb.publishMethod(eb, topic, true, args...)
-}
-
-func publishDraining(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error) {
-	done := make(chan interface{})
-	close(done)
-	return done, ErrDraining
-}
-
-// Store reflected type of context
-var ctxType reflect.Type
-
-func init() {
-	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
-}
-
-func publishNormal(eb *Bus, topic *topicIdentifier, txn bool, args ...interface{}) (<-chan interface{}, error) {
-	done := make(chan interface{})
-
-	// I need to claim the publish number before adding to queue
-	eb.eventWatcher.L.Lock()
-	pubNum := eb.publishedNumber + 1
-	eb.publishedNumber = pubNum
-	eb.eventWatcher.L.Unlock()
-
-	//  Add on context values if first arg is a context.
-	if (len(args) > 0) && (reflect.TypeOf(args[0]).Implements(ctxType)) {
-		var ti TopicIdentifier = topic
-		args[0] = context.WithValue(
-			context.WithValue(
-				reflect.ValueOf(args[0]).Interface().(context.Context), EventTopic, ti), EventNumber, pubNum)
+		// do work.
+		// inside this method, a topic's callbackLock is held.
+		run.run()
 	}
-
-	ev := argEvent{
-		topic:         topic,
-		args:          args,
-		eventNumber:   pubNum,
-		finished:      done,
-		transactional: txn,
-	}
-
-	// This results in unmanaged locking of the entire
-	// eventbus and starves the consumer.
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-	eb.pendingEvents.Add(ev)
-
-	// Broadcast the publish count change AFTER adding the event to the queue.
-	// I want to make sure data is available when I send the signal.
-	eb.eventWatcher.L.Lock()
-	eb.eventWatcher.Broadcast()
-	eb.eventWatcher.L.Unlock()
-
-	return done, nil
 }
 
-// processEvent obtains a lock.
-func processEvent(eb *Bus) <-chan interface{} {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-	done := make(chan interface{})
-	defer close(done)
-
-	// Quit if there are no events.
-	if eb.pendingEvents.Length() == 0 {
-		// Yield thread, since this spins forever.
-		runtime.Gosched()
-
-		return done
-	}
-
-	// Pop off the first event.
-	ev := eb.pendingEvents.Remove().(argEvent)
-	defer close(ev.finished)
-
-	// Find the listeners for it
-	listeners, ok := eb.listeners[ev.topic.ID()]
-
-	// If there are no listeners, just quit.
-	if !ok || len(listeners) == 0 {
-		// Publish the signal AFTER the event is handled
-		// and removed from the queue, while a lock still exists.
-		eb.eventWatcher.L.Lock()
-		eb.consumedNumber = ev.eventNumber
-		eb.eventWatcher.Broadcast()
-		eb.eventWatcher.L.Unlock()
-		return done
-	}
-
-	// call all listeners concurrently and then wait for them to complete.
-	var lwg sync.WaitGroup
-	lwg.Add(len(listeners))
-
-	params := ev.createParams()
-
-	// need to handle listeners subscribed with Once
-	// before returning, so it's a special case for
-	// unsubscribe.
-	for i := len(listeners) - 1; i >= 0; i-- {
-		listener := listeners[i]
-		if listener == nil {
-			panic(fmt.Sprintf("%vth listener for %d is nil", i, ev.topic.ID()))
-		}
-
-		// Wrap handler callback.
-		invokeHndlr := func(l *eventHandler) {
-			defer lwg.Done()
-			l.call(params)
-		}
-
-		// Call callback.
-		if ev.transactional {
-			invokeHndlr(listener)
-		} else {
-			go invokeHndlr(listener)
-		}
-
-		// Remove it from the list if needed.
-		if listener.flagOnce {
-			listeners = append(listeners[:i], listeners[i+1:]...)
-		}
-	}
-
-	// Unlock queue early so publishers can add to it
-	// while we suspend for the listeners.
-	eb.queueLocker.Unlock()
-
-	// Wait until all listeners are done.
-	lwg.Wait()
-
-	// Publish the signal AFTER the event is handled
-	// and removed from the queue, while a lock still exists.
-	eb.eventWatcher.L.Lock()
-	eb.consumedNumber = ev.eventNumber
-	eb.eventWatcher.Broadcast()
-	eb.eventWatcher.L.Unlock()
-
-	// Mark that the event is done.
-	eb.queueLocker.Lock()
-
-	return done
+type callbackContainer[T any] struct {
+	// id is unique per callback per topic.
+	// this needs to exist to handle unsubscribe
+	id uint64
+	// fn is the actual callback function to invoke
+	fn Callback[T]
 }
 
-// Unsubscribe will unsubscribe a handler from a topic.
-type Unsubscribe func() <-chan interface{}
-
-// subscribe adds a new handler for the given topic.
-// Subcription is actually an event, so you don't need to
-// worry about receiving events that haven't started processing
-// yet.
-// This function returns a channel indicating when the subscribe has
-// taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribe(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
-	return eb.subscribeImplementation(topic, false, fn)
+// event is a topic event.
+type event[T any] struct {
+	ctxArg context.Context
+	arg    T
+	topic  *Topic[T]
+	wg     *sync.WaitGroup
 }
 
-// subscribeOnce adds a new handler for the given topic.
-// Subcription is actually an event, so you don't need to
-// worry about receiving events that haven't started processing
-// yet.
-// Once indicates that the handler should unsubscribe after
-// receiving its first call.
-// This function returns a channel indicating when the subscribe has
-// taken effect, or an error if the params were incorrect.
-func (eb *Bus) subscribeOnce(topic *topicIdentifier, fn interface{}) (<-chan interface{}, Unsubscribe) {
-	return eb.subscribeImplementation(topic, true, fn)
+func (e *event[T]) run() {
+	// signal done for wait()
+	defer e.wg.Done()
+
+	// hold callbackLock so we can range on callbacks
+	e.topic.callbackLock.Lock()
+	defer e.topic.callbackLock.Unlock()
+
+	// invoke callbacks
+	for _, cc := range e.topic.callbacks {
+		cc.fn(e.ctxArg, e.arg)
+	}
 }
 
-func (eb *Bus) subscribeImplementation(topic *topicIdentifier, once bool, fn interface{}) (<-chan interface{}, Unsubscribe) {
-	// Store information on caller.
-	_, callerFile, callerLine, ok := runtime.Caller(2)
-	callerMsg := "unknown"
-	if ok {
-		callerMsg = fmt.Sprintf("%s [%v]", callerFile, callerLine)
-	}
-
-	// check shapeMap
-	fnType := reflect.TypeOf(fn)
-	argTypes := make([]reflect.Type, fnType.NumIn())
-	for i := range argTypes {
-		argTypes[i] = fnType.In(i)
-	}
-
-	evh := newHandler(topic, once, callerMsg, fn)
-
-	// Create the listener collection
-	eb.queueLocker.Lock()
-	currentListeners, ok := eb.listeners[topic.id]
-	// Topic doesn't exist yet, so create it.
-	if (!ok) || currentListeners == nil {
-		eb.listeners[topic.id] = make([]*eventHandler, 0)
-	}
-	eb.queueLocker.Unlock()
-
-	id := evh.id
-	unsub := func() <-chan interface{} {
-		return eb.unsubscribe(topic, id)
-	}
-
-	sub, _ := eb.publish(eb.subscribeTopic, eb, evh)
-	// Publish only returns an error when draining.
-	// Drop the error during subscribe.
-	return sub, unsub
+// subscribeEvent is an internal event that delays callback subscription
+type subscribeEvent[T any] struct {
+	topic    *Topic[T]
+	callback *callbackContainer[T]
+	wg       *sync.WaitGroup
 }
 
-// This is the subscribe handler.
-func subscribe(eb *Bus, evh eventHandler) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-
-	// Add it to the list.
-	eb.listeners[evh.topic.id] = append(eb.listeners[evh.topic.id], &evh)
+func (s *subscribeEvent[T]) run() {
+	s.topic.callbackLock.Lock()
+	defer s.topic.callbackLock.Unlock()
+	s.topic.callbacks = append(s.topic.callbacks, s.callback)
+	s.wg.Done()
 }
 
-// unsubscribe removes a handler from the given topic.
-// Unsubscription is actually an event, so you don't need to
-// worry about missing events that haven't started processing
-// yet.
-// This function returns a channel indicating when the unsubscribe
-// has taken effect.
-func (eb *Bus) unsubscribe(topic *topicIdentifier, id uint64) <-chan interface{} {
-	done, _ := eb.publish(eb.unsubscribeTopic, eb, topic, id)
-	// Publish only returns an error when draining.
-	// Drop the error during unsubscribe.
-	return done
+// unsubscribeEvent is an internal event that delays callback removal
+type unsubscribeEvent[T any] struct {
+	topic      *Topic[T]
+	callbackID uint64
+	wg         *sync.WaitGroup
 }
 
-// This is the unsubscribe handler.
-func unsubscribe(eb *Bus, topic *topicIdentifier, id uint64) {
-	eb.queueLocker.Lock()
-	defer eb.queueLocker.Unlock()
-
-	v, ok := eb.listeners[topic.id]
-
-	if !ok {
-		return
-	}
+func (u *unsubscribeEvent[T]) run() {
+	u.topic.callbackLock.Lock()
+	defer u.topic.callbackLock.Unlock()
 
 	// Find the index for the handler.
 	index := -1
-	for i, handler := range v {
-		if handler.id == id {
+	for i, handler := range u.topic.callbacks {
+		if handler.id == u.callbackID {
 			index = i
 			break
 		}
 	}
 
+	defer u.wg.Done()
+
 	if index < 0 {
+		// not found
 		return
 	}
 
-	if len(v) == 1 {
-		eb.listeners[topic.id] = make([]*eventHandler, 0)
+	// it's the last one
+	if len(u.topic.callbacks) == 1 {
+		u.topic.callbacks = []*callbackContainer[T]{}
 		return
 	}
 
-	// Remove it.
-	eb.listeners[topic.id] = append(v[:index], v[index+1:]...)
+	// delete it
+	u.topic.callbacks = append(u.topic.callbacks[:index], u.topic.callbacks[index+1:]...)
 }
